@@ -350,6 +350,7 @@ impl Inner {
         pairing_sm.handle_l2cap_command(command, payload, &mut ops)
     }
 
+    #[cfg(feature = "central")]
     fn handle_central<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
@@ -611,13 +612,18 @@ impl Inner {
                 user_initiated,
             )?);
         } else {
-            self.pairing_sm = Some(Pairing::initiate_central(
-                local_address,
-                peer_address,
-                &mut ops,
-                local_io,
-                user_initiated,
-            )?);
+            #[cfg(feature = "central")]
+            {
+                self.pairing_sm = Some(Pairing::initiate_central(
+                    local_address,
+                    peer_address,
+                    &mut ops,
+                    local_io,
+                    user_initiated,
+                )?);
+            }
+            #[cfg(not(feature = "central"))]
+            return Err(Error::NotSupported);
         }
         Ok(())
     }
@@ -865,6 +871,7 @@ impl<'d> SecurityManager<'d> {
         )
     }
 
+    #[cfg(feature = "central")]
     fn handle_central<P: PacketPool>(
         &self,
         pdu: Pdu<P::Packet>,
@@ -895,7 +902,14 @@ impl<'d> SecurityManager<'d> {
         let result = if role == LeConnRole::Peripheral {
             self.handle_peripheral(pdu, connections, storage)
         } else {
-            self.handle_central(pdu, connections, storage)
+            #[cfg(feature = "central")]
+            {
+                self.handle_central(pdu, connections, storage)
+            }
+            #[cfg(not(feature = "central"))]
+            {
+                Err(Error::NotSupported)
+            }
         };
 
         {
@@ -1355,6 +1369,30 @@ mod tests {
             #[cfg(feature = "legacy-pairing")]
             secure_connections_only: false,
         }
+    }
+
+    #[cfg(not(feature = "central"))]
+    #[test]
+    fn central_initiation_requires_central_feature() {
+        let mgr = setup_manager();
+        let handle = ConnHandle::new(5);
+        let peer = Address::random([0x13, 2, 3, 4, 5, 6]);
+        unwrap!(mgr.connect(handle, peer, LeConnRole::Central, ConnParams::new()));
+
+        let mut inner = test_inner(peer);
+        inner.pairing_sm = None;
+        let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+
+        unwrap!(mgr.with_connected_handle(handle, |storage| {
+            assert!(matches!(
+                inner.initiate(&mut bonds, &events, mgr, storage, true),
+                Err(Error::NotSupported)
+            ));
+            assert!(inner.pairing_sm.is_none());
+            assert!(events.try_receive().is_err());
+            Ok(())
+        }));
     }
 
     #[test]
