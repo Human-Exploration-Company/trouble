@@ -801,9 +801,34 @@ impl<'d, M: RawMutex, const MAX: usize> ServiceBuilder<'_, 'd, M, MAX> {
         permissions: AttPermissions,
         data: AttributeData<'d>,
     ) -> CharacteristicBuilder<'_, 'd, T, M, MAX> {
-        let chrc_uuid = uuid;
+        let (handle, cccd_handle) = self.push_characteristic(uuid, props, permissions, data);
+        CharacteristicBuilder {
+            handle: Characteristic {
+                handle,
+                cccd_handle,
+                // Temporarily set to value handle; updated in build() after descriptors are added
+                end_handle: cccd_handle.unwrap_or(handle),
+                props,
+                uuid,
+                phantom: PhantomData,
+            },
+            table: self.table,
+        }
+    }
+
+    /// Push a characteristic's declaration, its value and, if it notifies or
+    /// indicates, its CCCD: their value and CCCD handles. Apart from
+    /// [`Self::add_characteristic_internal`], so that each value type does
+    /// not carry a copy.
+    pub(crate) fn push_characteristic(
+        &mut self,
+        uuid: Uuid,
+        props: CharacteristicProps,
+        permissions: AttPermissions,
+        data: AttributeData<'d>,
+    ) -> (u16, Option<u16>) {
         // First the characteristic declaration
-        let (handle, cccd_handle) = self.table.with_inner_mut(|table| {
+        self.table.with_inner_mut(|table| {
             let value_handle = table.next_handle() + 1;
             let declaration = CharacteristicDeclaration::new(props, value_handle, uuid);
             table.push(Attribute::new(CHARACTERISTIC, AttPermissions::read_only(), declaration));
@@ -834,20 +859,7 @@ impl<'d, M: RawMutex, const MAX: usize> ServiceBuilder<'_, 'd, M, MAX> {
             };
 
             (value_handle, cccd_handle)
-        });
-
-        CharacteristicBuilder {
-            handle: Characteristic {
-                handle,
-                cccd_handle,
-                // Temporarily set to value handle; updated in build() after descriptors are added
-                end_handle: cccd_handle.unwrap_or(handle),
-                props,
-                uuid: chrc_uuid,
-                phantom: PhantomData,
-            },
-            table: self.table,
-        }
+        })
     }
 
     /// Add a characteristic to this service with a refererence to a mutable storage buffer.

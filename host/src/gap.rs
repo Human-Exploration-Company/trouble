@@ -160,18 +160,39 @@ pub(crate) fn build_gatt_service<M: RawMutex, const MAX: usize>(table: &mut Attr
     let mut gatt_builder = table.add_service(Service::new(service::GATT));
     #[cfg(feature = "gatt-caching")]
     {
-        // The value is only ever indicated, never read.
-        gatt_builder.add_characteristic_small(
-            characteristic::SERVICE_CHANGED,
-            [CharacteristicProp::Indicate],
-            [0u8; 4],
-        );
-        // Variable length: a client writes as many octets as it knows of.
-        gatt_builder.add_characteristic_client::<heapless::Vec<u8, CLIENT_SUPPORTED_FEATURES_LEN>, _, _>(
-            characteristic::CLIENT_SUPPORTED_FEATURES,
-            [CharacteristicProp::Read, CharacteristicProp::Write],
-        );
-        gatt_builder.add_characteristic_small(characteristic::DATABASE_HASH, [CharacteristicProp::Read], [0u8; 16]);
+        use crate::attribute::{AttributeData, CharacteristicProps, MAX_SMALL_DATA_SIZE};
+        // Fixed-length values held in the table; written out rather than
+        // through `add_characteristic_small`, whose every value type carries
+        // its own copy of the code.
+        let small = |len: u8| AttributeData::SmallData {
+            variable_len: false,
+            capacity: len,
+            len,
+            value: [0; MAX_SMALL_DATA_SIZE],
+        };
+        let client = AttributeData::ClientSpecific {
+            variable_len: true,
+            capacity: CLIENT_SUPPORTED_FEATURES_LEN as u16,
+        };
+        let characteristics = [
+            // The value is only ever indicated, never read.
+            (
+                characteristic::SERVICE_CHANGED,
+                CharacteristicProp::Indicate as u8,
+                small(4),
+            ),
+            // Variable length: a client writes as many octets as it knows of.
+            (
+                characteristic::CLIENT_SUPPORTED_FEATURES,
+                CharacteristicProp::Read as u8 | CharacteristicProp::Write as u8,
+                client,
+            ),
+            (characteristic::DATABASE_HASH, CharacteristicProp::Read as u8, small(16)),
+        ];
+        for (uuid, props, data) in characteristics {
+            let props = CharacteristicProps::from(props);
+            gatt_builder.push_characteristic(uuid.into(), props, props.default_permissions(), data);
+        }
     }
     gatt_builder.build();
 }
