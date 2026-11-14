@@ -150,12 +150,11 @@ NOTE: Notifications/indications will only be delivered if the client has enabled
 A client may keep the attribute table it discovered and reuse it on later connections.
 Without the `gatt-caching` feature the GATT service is empty, and a client may assume that the table never changes: after a firmware update that changes it, the client keeps using the handles it cached.
 
-With `gatt-caching`, the GATT service carries Service Changed, Client Supported Features and Database Hash (Core Spec Vol 3, Part G, Section 7), and the server implements Robust Caching (Section 2.5.2.1):
+With `gatt-caching`, the GATT service carries Service Changed (Core Spec Vol 3, Part G, Section 7.1), and the server tells a bonded client whose cache predates a change to the table (Section 2.5.2):
 
-* A client without a bond may not trust a cache across connections, since Service Changed exists: it rediscovers, or checks its cache against the Database Hash.
-* A client with Robust Caching that the server knows to be change-unaware is answered Database Out Of Sync, naming the handle of its request, its commands are ignored, and it receives no notification or indication but Service Changed, until it reads the Database Hash or has been answered once.
-* The Database Hash is computed when the server is created, and tells a client that compares it whether its cache is current.
-* Client Supported Features is up to 4 octets long; a client writes as many as it knows, octets it leaves out read as zero, and a write that would clear a bit the client set, a shorter or empty one included, is refused with Value Not Allowed.
+* A client without a bond may not trust a cache across connections, since Service Changed exists: it rediscovers.
+* A bonded client that enabled the indication is sent Service Changed for handles 0x0001 to 0xFFFF once, after the table changed, and knows the table once it confirms.
+* Nothing else: no Database Hash, no Client Supported Features, no Robust Caching. With Service Changed, a Database Hash characteristic obliges the server to Robust Caching (Section 2.5.2.1), and Client Supported Features shall not exist without the hash, Enhanced ATT or multiple handle value notifications (Section 7, Table 7.1, C.2). A client that does not know the table is served as any other until it is told.
 
 The Service Changed handle must never change while any client is bonded (Section 7.1): a bonded client keeps it to learn that everything else moved.
 `#[gatt_server]` puts the GAP service first and the GATT service after it, so Service Changed is at `gap::SERVICE_CHANGED_VALUE_HANDLE`: 8, or 10 with both `central` and `security`, whose Central Address Resolution characteristic moves the GATT service from handle 6 to 8.
@@ -170,31 +169,31 @@ const _: () = assert!(trouble_host::gap::SERVICE_CHANGED_VALUE_HANDLE == 8);
 The server holds each client's state in one of the `connections_max` slots of `#[gatt_server]` (1 by default).
 A disconnected bonded client keeps its slot until its bond is removed, or until a new client finds every slot taken and takes the slot of a disconnected one.
 To keep every bonded client's slot, make `connections_max` the number of bonds plus the number of links that can be open at once.
-A client that pairs again with the identity of a bond begins a new one: when `GattConnection::next` returns `PairingComplete` with a bond, the server drops the Service Changed CCCD and supported features the client set under the old bond, keeping what it wrote on this connection, and the client is change-aware.
+A client that pairs again with the identity of a bond begins a new one: when `GattConnection::next` returns `PairingComplete` with a bond, the server drops the Service Changed CCCD the client set under the old bond, keeping one it wrote on this connection, and the client knows the table.
 
-A bonded client's state must survive reconnections and resets, so the application keeps it with the bond:
+A bonded client's state must survive reconnections and resets, so the application keeps it with the bond.
+`AttributeServer::database_hash` identifies the table: it is computed as Section 7.3.1 has it when the server is created, and is not exposed to clients.
 
 [source,rust]
 ----
 // When the bonded client connects, before its requests are processed.
-// `kept_hash` is the Database Hash the client last knew.
+// `kept_hash` is the hash of the table the client last knew.
 server.restore_client_caching(
     conn.raw(),
     ClientCaching {
         service_changed: kept.service_changed,
-        supported_features: kept.supported_features,
         change_aware: kept_hash == server.database_hash(),
     },
 );
 
-// Once the link is encrypted: tell a change-unaware client that everything changed.
-// Ok(true) once it confirmed, from when it is change-aware; Ok(false), and nothing
-// sent, for a client that is change-aware or did not enable the indication.
+// Once the link is encrypted: tell a client that does not know the table
+// that everything changed. Ok(true) once it confirmed; Ok(false), and
+// nothing sent, for a client that knows it or did not enable the indication.
 server.indicate_service_changed(&conn).await?;
 
-// Whenever it may have changed (the client wrote its Service Changed CCCD or its
-// supported features, or became change-aware), keep the new state, with the
-// current hash if the client is change-aware.
+// Whenever it may have changed (the client wrote its Service Changed CCCD,
+// or confirmed the indication), keep the new state, with the current hash
+// if the client knows the table.
 if let Some(caching) = server.client_caching(conn.raw()) {
     // persist `caching` and, if `caching.change_aware`, `server.database_hash()`
 }

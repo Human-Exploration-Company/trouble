@@ -91,11 +91,13 @@ legacy-pairing = ["security"]
 # Enable Isochronous endpoint support
 iso = []
 
-# Enable GATT caching on the server: the GATT service carries Service Changed,
-# Client Supported Features and Database Hash, and the server implements Robust
-# Caching (Core Spec Vol 3, Part G, Section 2.5.2). The application keeps each
+# Enable GATT caching on the server: the GATT service carries Service Changed
+# (Core Spec Vol 3, Part G, Sections 2.5.2 and 7.1), without Database Hash,
+# Client Supported Features or Robust Caching. The application keeps each
 # bonded client's state across connections and resets
-# (`AttributeServer::client_caching`, `AttributeServer::restore_client_caching`).
+# (`AttributeServer::client_caching`, `AttributeServer::restore_client_caching`),
+# with the table's hash (`AttributeServer::database_hash`), which needs the
+# AES-CMAC of `security`.
 gatt-caching = ["gatt", "security"]
 
 # Enable ATT queued writes (long characteristic writes)

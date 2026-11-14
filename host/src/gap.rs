@@ -20,11 +20,9 @@ const DEVICE_NAME_MAX_LENGTH: usize = 22;
 /// ├── APPEARANCE:                   2
 /// └── CENTRAL_ADDRESS_RESOLUTION:   2 (security+central only)
 /// GATT_SERVICE:                   + 1
-/// ├── SERVICE_CHANGED:              3 (gatt-caching only)
-/// ├── CLIENT_SUPPORTED_FEATURES:    2 (gatt-caching only)
-/// └── DATABASE_HASH:                2 (gatt-caching only)
+/// └── SERVICE_CHANGED:              3 (gatt-caching only)
 ///                                 ---
-///                                 = 6 (or 8 with security+central), 7 more with gatt-caching
+///                                 = 6 (or 8 with security+central), 3 more with gatt-caching
 pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize =
     6 + if cfg!(all(feature = "security", feature = "central")) {
         2
@@ -33,7 +31,7 @@ pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize =
     } + GATT_CACHING_ATTRIBUTE_COUNT;
 
 #[cfg(feature = "gatt-caching")]
-const GATT_CACHING_ATTRIBUTE_COUNT: usize = 7;
+const GATT_CACHING_ATTRIBUTE_COUNT: usize = 3;
 #[cfg(not(feature = "gatt-caching"))]
 const GATT_CACHING_ATTRIBUTE_COUNT: usize = 0;
 
@@ -45,12 +43,6 @@ const GATT_CACHING_ATTRIBUTE_COUNT: usize = 0;
 /// service.
 #[cfg(feature = "gatt-caching")]
 pub const SERVICE_CHANGED_VALUE_HANDLE: u16 = (GAP_SERVICE_ATTRIBUTE_COUNT - GATT_CACHING_ATTRIBUTE_COUNT) as u16 + 2;
-
-/// The length of the Client Supported Features value the server keeps for
-/// each client: octet 0 holds every bit the specification defines (Core
-/// Spec Vol 3, Part G, Section 7.2).
-#[cfg(feature = "gatt-caching")]
-pub const CLIENT_SUPPORTED_FEATURES_LEN: usize = 4;
 
 /// Configuration for the GAP Service.
 pub enum GapConfig<'a> {
@@ -150,49 +142,35 @@ impl<'a> CentralConfig<'a> {
     }
 }
 
-/// The GATT service. With `gatt-caching` it carries what a client needs to
-/// keep a cache of the database correct: Service Changed (Core Spec Vol 3,
-/// Part G, Section 7.1), Client Supported Features (7.2) and Database Hash
-/// (7.3). The hash is filled in once the table is complete, when the
-/// [`AttributeServer`] is created from it.
+/// The GATT service. With `gatt-caching` it carries Service Changed (Core
+/// Spec Vol 3, Part G, Section 7.1), so that a client that kept the table
+/// hears when it changes. Neither Database Hash nor Client Supported
+/// Features: with Service Changed, the Database Hash obliges the server to
+/// Robust Caching (Section 2.5.2.1), and without the hash, Enhanced ATT and
+/// multiple handle value notifications, Client Supported Features shall not
+/// exist (Section 7, Table 7.1, C.2).
 pub(crate) fn build_gatt_service<M: RawMutex, const MAX: usize>(table: &mut AttributeTable<'_, M, MAX>) {
     #[allow(unused_mut)]
     let mut gatt_builder = table.add_service(Service::new(service::GATT));
     #[cfg(feature = "gatt-caching")]
     {
         use crate::attribute::{AttributeData, CharacteristicProps, MAX_SMALL_DATA_SIZE};
-        // Fixed-length values held in the table; written out rather than
-        // through `add_characteristic_small`, whose every value type carries
-        // its own copy of the code.
-        let small = |len: u8| AttributeData::SmallData {
+        // The value is only ever indicated, never read. Written out rather
+        // than through `add_characteristic_small`, whose every value type
+        // carries its own copy of the code.
+        let data = AttributeData::SmallData {
             variable_len: false,
-            capacity: len,
-            len,
+            capacity: 4,
+            len: 4,
             value: [0; MAX_SMALL_DATA_SIZE],
         };
-        let client = AttributeData::ClientSpecific {
-            variable_len: true,
-            capacity: CLIENT_SUPPORTED_FEATURES_LEN as u16,
-        };
-        let characteristics = [
-            // The value is only ever indicated, never read.
-            (
-                characteristic::SERVICE_CHANGED,
-                CharacteristicProp::Indicate as u8,
-                small(4),
-            ),
-            // Variable length: a client writes as many octets as it knows of.
-            (
-                characteristic::CLIENT_SUPPORTED_FEATURES,
-                CharacteristicProp::Read as u8 | CharacteristicProp::Write as u8,
-                client,
-            ),
-            (characteristic::DATABASE_HASH, CharacteristicProp::Read as u8, small(16)),
-        ];
-        for (uuid, props, data) in characteristics {
-            let props = CharacteristicProps::from(props);
-            gatt_builder.push_characteristic(uuid.into(), props, props.default_permissions(), data);
-        }
+        let props = CharacteristicProps::from(CharacteristicProp::Indicate as u8);
+        gatt_builder.push_characteristic(
+            characteristic::SERVICE_CHANGED.into(),
+            props,
+            props.default_permissions(),
+            data,
+        );
     }
     gatt_builder.build();
 }
