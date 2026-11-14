@@ -188,7 +188,8 @@ server.restore_client_caching(
 );
 
 // Once the link is encrypted: tell a change-unaware client that everything changed.
-// Ok(true) once it confirmed, from when it is change-aware.
+// Ok(true) once it confirmed, from when it is change-aware; Ok(false), and nothing
+// sent, for a client that is change-aware or did not enable the indication.
 server.indicate_service_changed(&conn).await?;
 
 // Whenever it may have changed (the client wrote its Service Changed CCCD or its

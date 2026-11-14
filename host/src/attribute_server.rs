@@ -87,21 +87,34 @@ struct CachingHandles {
 
 #[cfg(feature = "gatt-caching")]
 impl CachingHandles {
+    /// `build_gatt_service` lays them out in order: Service Changed's
+    /// declaration, value and CCCD, then Client Supported Features' and
+    /// Database Hash's declarations and values. In one pass over the table.
     fn find<M: RawMutex, const MAX: usize>(table: &AttributeTable<'_, M, MAX>) -> Option<Self> {
         use bt_hci::uuid::characteristic::{CLIENT_SUPPORTED_FEATURES, DATABASE_HASH, SERVICE_CHANGED};
-        let find = |uuid: Uuid| table.iterate(|mut it| it.find(|(_, att)| att.uuid == uuid).map(|(handle, _)| handle));
-        let service_changed = find(SERVICE_CHANGED.into())?;
-        let service_changed_cccd = service_changed + 1;
-        if table.uuid(service_changed_cccd)
-            != Some(bt_hci::uuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION.into())
-        {
-            return None;
-        }
-        Some(Self {
-            service_changed,
-            service_changed_cccd,
-            client_features: find(CLIENT_SUPPORTED_FEATURES.into())?,
-            database_hash: find(DATABASE_HASH.into())?,
+        use bt_hci::uuid::declarations::CHARACTERISTIC;
+        use bt_hci::uuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION;
+        let expected = [
+            Uuid::from(SERVICE_CHANGED),
+            Uuid::from(CLIENT_CHARACTERISTIC_CONFIGURATION),
+            Uuid::from(CHARACTERISTIC),
+            Uuid::from(CLIENT_SUPPORTED_FEATURES),
+            Uuid::from(CHARACTERISTIC),
+            Uuid::from(DATABASE_HASH),
+        ];
+        table.iterate(|mut it| {
+            let (service_changed, _) = it.find(|(_, att)| att.uuid == expected[0])?;
+            for uuid in &expected[1..] {
+                if it.next()?.1.uuid != *uuid {
+                    return None;
+                }
+            }
+            Some(Self {
+                service_changed,
+                service_changed_cccd: service_changed + 1,
+                client_features: service_changed + 3,
+                database_hash: service_changed + 5,
+            })
         })
     }
 
@@ -387,7 +400,7 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
             let caching = CachingHandles::find(&att_table);
             let hash = att_table.hash();
             if let Some(handles) = caching {
-                unwrap!(att_table.set_raw(handles.database_hash, &hash.to_le_bytes()));
+                unwrap!(att_table.write(handles.database_hash, 0, &hash.to_le_bytes()));
             }
             (caching, hash)
         };
@@ -496,10 +509,10 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     /// Indicate Service Changed for the whole database to the client, if it
-    /// enabled the indication: `Ok(true)` once it confirmed, from when it is
-    /// change-aware. For a bonded client whose cache predates a change to the
-    /// database, once its link is encrypted (Core Spec Vol 3, Part G,
-    /// Sections 2.5.2 and 7.1).
+    /// is change-unaware and enabled the indication: `Ok(true)` once it
+    /// confirmed, from when it is change-aware. For a bonded client whose
+    /// cache predates a change to the database, once its link is encrypted
+    /// (Core Spec Vol 3, Part G, Sections 2.5.2 and 7.1).
     #[cfg(feature = "gatt-caching")]
     pub async fn indicate_service_changed(
         &self,
@@ -507,7 +520,8 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     ) -> Result<bool, Error> {
         let handles = self.caching.ok_or(Error::NotFound)?;
         let conn = connection.raw();
-        if !self.should_indicate(conn, handles.service_changed_cccd) {
+        let owed = |caching: ClientCaching| caching.service_changed && !caching.change_aware;
+        if !self.client_caching(conn).is_some_and(owed) {
             return Ok(false);
         }
         // Any client may enable it: there is no security to raise first.
@@ -2259,6 +2273,54 @@ mod tests {
             // Confirmed: the client is change-aware.
             assert!(change_aware(&s));
             assert_eq!(admit(&s, &READ), Ok(()));
+        }
+
+        #[test]
+        fn service_changed_is_not_indicated_to_a_change_aware_client() {
+            let s = setup_caching();
+            s.server.restore_client_caching(
+                &s.conn,
+                ClientCaching {
+                    change_aware: true,
+                    ..ROBUST
+                },
+            );
+            let gatt = unwrap!(GattConnection::try_new(s.conn.clone(), s.server));
+            assert_eq!(block_on(s.server.indicate_service_changed(&gatt)), Ok(false));
+            assert!(change_aware(&s));
+        }
+
+        #[test]
+        fn caching_needs_its_characteristics_as_the_gatt_service_lays_them_out() {
+            // Service Changed without its CCCD.
+            let mut table: AttributeTable<'static, NoopRawMutex, SIZE> = AttributeTable::new();
+            let mut gatt = table.add_service(Service::new(Uuid::new_short(0x1801)));
+            gatt.add_characteristic_small(SERVICE_CHANGED, [CharacteristicProp::Read], [0u8; 4]);
+            gatt.add_characteristic_small(
+                CLIENT_SUPPORTED_FEATURES,
+                [CharacteristicProp::Read, CharacteristicProp::Write],
+                [0u8; 4],
+            );
+            gatt.add_characteristic_small(DATABASE_HASH, [CharacteristicProp::Read], [0u8; 16]);
+            gatt.build();
+            assert!(CachingHandles::find(&table).is_none());
+            // As `build_gatt_service` lays them out.
+            let s = setup_caching();
+            let handles = unwrap!(CachingHandles::find(s.server.table()));
+            assert_eq!(
+                (
+                    handles.service_changed,
+                    handles.service_changed_cccd,
+                    handles.client_features,
+                    handles.database_hash
+                ),
+                (
+                    SERVICE_CHANGED_VALUE,
+                    SERVICE_CHANGED_CCCD,
+                    CLIENT_FEATURES,
+                    DATABASE_HASH_VALUE
+                )
+            );
         }
 
         #[test]
