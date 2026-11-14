@@ -26,6 +26,7 @@ cargo batch \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,security \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,legacy-pairing \
+    --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,gatt-caching \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features central,security \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan,security \
     --- build --release --manifest-path host/Cargo.toml --no-default-features --features gatt,peripheral,central,scan,legacy-pairing \
@@ -57,10 +58,13 @@ cargo fmt --check --manifest-path ./host/Cargo.toml
 cargo fmt --check --manifest-path ./tester/app/Cargo.toml
 cargo fmt --check --manifest-path ./tester/nrf52/Cargo.toml
 cargo clippy --manifest-path ./host/Cargo.toml --features gatt,peripheral,central,legacy-pairing
+cargo clippy --manifest-path ./host/Cargo.toml --features gatt,peripheral,central,gatt-caching
 cargo test --manifest-path ./host/Cargo.toml --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --features central,gatt,peripheral,scan,security --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --no-default-features --features gatt,peripheral,security,default-packet-pool --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --no-default-features --features gatt,peripheral,legacy-pairing,default-packet-pool --lib -- --nocapture
+cargo test --manifest-path ./host/Cargo.toml --no-default-features --features gatt,peripheral,gatt-caching,default-packet-pool --lib -- --nocapture
+cargo test --manifest-path ./host/Cargo.toml --features central,gatt,peripheral,scan,gatt-caching --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --features central,gatt,peripheral,scan,legacy-pairing --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --features central,gatt,peripheral,scan,security,att-queued-writes --lib -- --nocapture
 cargo test --manifest-path ./host/Cargo.toml --features central,gatt,peripheral,scan,security,l2cap-sdu-reassembly-optimization --lib -- --nocapture

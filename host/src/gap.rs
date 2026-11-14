@@ -20,16 +20,22 @@ const DEVICE_NAME_MAX_LENGTH: usize = 22;
 /// ├── APPEARANCE:                   2
 /// └── CENTRAL_ADDRESS_RESOLUTION:   2 (security+central only)
 /// GATT_SERVICE:                   + 1
+/// ├── SERVICE_CHANGED:              3 (gatt-caching only)
+/// ├── CLIENT_SUPPORTED_FEATURES:    2 (gatt-caching only)
+/// └── DATABASE_HASH:                2 (gatt-caching only)
 ///                                 ---
-///                                 = 6 (or 8 with security+central)
-#[cfg(not(feature = "security"))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
-/// The number of attributes added by the GAP and GATT services (with security, peripheral only)
-#[cfg(all(feature = "security", not(feature = "central")))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 6;
-/// The number of attributes added by the GAP and GATT services (with security)
-#[cfg(all(feature = "security", feature = "central"))]
-pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize = 8;
+///                                 = 6 (or 8 with security+central), 7 more with gatt-caching
+pub const GAP_SERVICE_ATTRIBUTE_COUNT: usize =
+    6 + if cfg!(all(feature = "security", feature = "central")) {
+        2
+    } else {
+        0
+    } + GATT_CACHING_ATTRIBUTE_COUNT;
+
+#[cfg(feature = "gatt-caching")]
+const GATT_CACHING_ATTRIBUTE_COUNT: usize = 7;
+#[cfg(not(feature = "gatt-caching"))]
+const GATT_CACHING_ATTRIBUTE_COUNT: usize = 0;
 
 /// Configuration for the GAP Service.
 pub enum GapConfig<'a> {
@@ -101,7 +107,7 @@ impl<'a> PeripheralConfig<'a> {
         gap_builder.add_characteristic_ro(characteristic::CENTRAL_ADDRESS_RESOLUTION, &1u8);
         gap_builder.build();
 
-        table.add_service(Service::new(service::GATT));
+        build_gatt_service(table);
 
         Ok(())
     }
@@ -123,10 +129,35 @@ impl<'a> CentralConfig<'a> {
         gap_builder.add_characteristic_ro(characteristic::CENTRAL_ADDRESS_RESOLUTION, &1u8);
         gap_builder.build();
 
-        table.add_service(Service::new(service::GATT));
+        build_gatt_service(table);
 
         Ok(())
     }
+}
+
+/// The GATT service. With `gatt-caching` it carries what a client needs to
+/// keep a cache of the database correct: Service Changed (Core Spec Vol 3,
+/// Part G, Section 7.1), Client Supported Features (7.2) and Database Hash
+/// (7.3). The hash is filled in once the table is complete, when the
+/// [`AttributeServer`] is created from it.
+pub(crate) fn build_gatt_service<M: RawMutex, const MAX: usize>(table: &mut AttributeTable<'_, M, MAX>) {
+    #[allow(unused_mut)]
+    let mut gatt_builder = table.add_service(Service::new(service::GATT));
+    #[cfg(feature = "gatt-caching")]
+    {
+        // The value is only ever indicated, never read.
+        gatt_builder.add_characteristic_small(
+            characteristic::SERVICE_CHANGED,
+            [CharacteristicProp::Indicate],
+            [0u8; 4],
+        );
+        gatt_builder.add_characteristic_client::<u8, _, _>(
+            characteristic::CLIENT_SUPPORTED_FEATURES,
+            [CharacteristicProp::Read, CharacteristicProp::Write],
+        );
+        gatt_builder.add_characteristic_small(characteristic::DATABASE_HASH, [CharacteristicProp::Read], [0u8; 16]);
+    }
+    gatt_builder.build();
 }
 
 #[cfg(test)]

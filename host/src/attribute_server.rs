@@ -19,6 +19,8 @@ mod client_att_table;
 struct Client {
     identity: Identity,
     is_connected: bool,
+    #[cfg(feature = "gatt-caching")]
+    caching: CachingState,
 }
 
 impl Client {
@@ -27,10 +29,149 @@ impl Client {
     }
 }
 
+/// Where a client stands with respect to changes in the database (Core Spec
+/// Vol 3, Part G, Section 2.5.2.1).
+#[cfg(feature = "gatt-caching")]
+#[derive(Clone, Copy)]
+struct CachingState {
+    change_aware: bool,
+    /// On this bearer, since the client became change-unaware, it was
+    /// answered Database Out Of Sync or it read the Database Hash: its next
+    /// request makes it change-aware.
+    resync_answered: bool,
+    /// The server has held this state since an earlier connection: it is
+    /// newer than any copy the application kept.
+    held: bool,
+}
+
+#[cfg(feature = "gatt-caching")]
+impl Default for CachingState {
+    /// A client without a trusted relationship is change-aware on connection.
+    fn default() -> Self {
+        Self {
+            change_aware: true,
+            resync_answered: false,
+            held: false,
+        }
+    }
+}
+
+#[cfg(feature = "gatt-caching")]
+impl CachingState {
+    fn become_aware(&mut self) {
+        self.change_aware = true;
+        self.resync_answered = false;
+    }
+}
+
+/// The GATT service's caching characteristics, found by UUID when the server
+/// is created.
+#[cfg(feature = "gatt-caching")]
+#[derive(Clone, Copy)]
+struct CachingHandles {
+    service_changed: u16,
+    service_changed_cccd: u16,
+    client_features: u16,
+    database_hash: u16,
+}
+
+#[cfg(feature = "gatt-caching")]
+impl CachingHandles {
+    fn find<M: RawMutex, const MAX: usize>(table: &AttributeTable<'_, M, MAX>) -> Option<Self> {
+        use bt_hci::uuid::characteristic::{CLIENT_SUPPORTED_FEATURES, DATABASE_HASH, SERVICE_CHANGED};
+        let find = |uuid: Uuid| table.iterate(|mut it| it.find(|(_, att)| att.uuid == uuid).map(|(handle, _)| handle));
+        let service_changed = find(SERVICE_CHANGED.into())?;
+        let service_changed_cccd = service_changed + 1;
+        if table.uuid(service_changed_cccd)
+            != Some(bt_hci::uuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION.into())
+        {
+            return None;
+        }
+        Some(Self {
+            service_changed,
+            service_changed_cccd,
+            client_features: find(CLIENT_SUPPORTED_FEATURES.into())?,
+            database_hash: find(DATABASE_HASH.into())?,
+        })
+    }
+
+    /// The client has enabled Robust Caching (Core Spec Vol 3, Part G, Section 7.2).
+    fn robust(&self, table: &ClientAttTable) -> bool {
+        table
+            .get(self.client_features)
+            .is_some_and(|v| v.first().is_some_and(|f| f & 1 != 0))
+    }
+}
+
+/// What a change-unaware client's request does (Core Spec Vol 3, Part G,
+/// Section 2.5.2.1).
+#[cfg(feature = "gatt-caching")]
+enum Resync {
+    /// Discovery, which a stale cache does not affect: performed normally.
+    Discovery,
+    /// A read of the Database Hash by type over the whole database: performed
+    /// normally, and the next request makes the client change-aware.
+    HashRead,
+    /// An operation at Attribute Handles the client may have from a stale
+    /// cache: answered Database Out Of Sync.
+    Operation,
+}
+
+#[cfg(feature = "gatt-caching")]
+impl Resync {
+    fn of(request: &AttReq<'_>) -> Self {
+        use bt_hci::uuid::characteristic::DATABASE_HASH;
+        use bt_hci::uuid::declarations::{CHARACTERISTIC, INCLUDE};
+        match request {
+            AttReq::ExchangeMtu { .. }
+            | AttReq::ReadByGroupType { .. }
+            | AttReq::FindInformation { .. }
+            | AttReq::FindByTypeValue { .. } => Self::Discovery,
+            AttReq::ReadByType {
+                start,
+                end,
+                attribute_type,
+            } => {
+                if *attribute_type == Uuid::from(INCLUDE) || *attribute_type == Uuid::from(CHARACTERISTIC) {
+                    Self::Discovery
+                } else if (*start, *end) != (0x0001, 0xffff) {
+                    Self::Operation
+                } else if *attribute_type == Uuid::from(DATABASE_HASH) {
+                    Self::HashRead
+                } else {
+                    Self::Discovery
+                }
+            }
+            _ => Self::Operation,
+        }
+    }
+}
+
+/// A client's GATT caching state (Core Spec Vol 3, Part G, Sections 2.5.2 and
+/// 7): for the application to keep across connections and resets for a
+/// bonded client, as the specification requires, and to restore on its
+/// next connection ([`AttributeServer::restore_client_caching`]).
+#[cfg(feature = "gatt-caching")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClientCaching {
+    /// The client's Service Changed CCCD enables indications.
+    pub service_changed: bool,
+    /// The client's Client Supported Features value.
+    pub supported_features: u8,
+    /// The client knows the current database: it is change-aware. Restore
+    /// `false` for a client whose cache predates a change to the database.
+    pub change_aware: bool,
+}
+
 /// A GATT server capable of processing the GATT protocol using the provided table of attributes.
 pub struct AttributeServer<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> {
     att_table: AttributeTable<'values, M, ATT_MAX>,
     client_att_tables: ClientAttTables<M, CONN_MAX>,
+    #[cfg(feature = "gatt-caching")]
+    caching: Option<CachingHandles>,
+    #[cfg(feature = "gatt-caching")]
+    database_hash: u128,
     _p: PhantomData<P>,
 }
 
@@ -54,6 +195,11 @@ pub(crate) mod sealed {
 
         fn can_read(&self, connection: &Connection<'_, P>, handle: u16) -> Result<(), AttErrorCode>;
         fn can_write(&self, connection: &Connection<'_, P>, handle: u16) -> Result<(), AttErrorCode>;
+
+        /// Whether the server performs `packet` for the client, as Robust
+        /// Caching decides; called once for each, before it is performed.
+        #[cfg(feature = "gatt-caching")]
+        fn admit(&self, connection: &Connection<'_, P>, packet: &AttClient) -> Result<(), AttErrorCode>;
     }
 }
 
@@ -145,19 +291,167 @@ impl<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> se
             .with_attribute(handle, |att| self.can_write(connection, att))
             .unwrap_or(Err(AttErrorCode::INVALID_HANDLE))
     }
+
+    #[cfg(feature = "gatt-caching")]
+    fn admit(&self, connection: &Connection<'_, P>, packet: &AttClient) -> Result<(), AttErrorCode> {
+        let Some(handles) = self.caching else {
+            return Ok(());
+        };
+        self.client_att_tables
+            .with_client_mut(&connection.peer_identity(), |client, table| {
+                let state = &mut client.caching;
+                if state.change_aware || !handles.robust(table) {
+                    return Ok(());
+                }
+                let request = match packet {
+                    AttClient::Request(request) => request,
+                    // A change-unaware client's commands are ignored.
+                    AttClient::Command(_) => return Err(AttErrorCode::DATABASE_OUT_OF_SYNC),
+                    AttClient::Confirmation(_) => return Ok(()),
+                };
+                if state.resync_answered {
+                    state.become_aware();
+                    return Ok(());
+                }
+                match Resync::of(request) {
+                    Resync::Discovery => Ok(()),
+                    Resync::HashRead => {
+                        state.resync_answered = true;
+                        Ok(())
+                    }
+                    // Sent once per bearer: the next request is performed.
+                    Resync::Operation => {
+                        state.resync_answered = true;
+                        Err(AttErrorCode::DATABASE_OUT_OF_SYNC)
+                    }
+                }
+            })
+            .unwrap_or(Ok(()))
+    }
 }
 
 impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize>
     AttributeServer<'values, M, P, ATT_MAX, CONN_MAX>
 {
     /// Create a new instance of the AttributeServer
+    ///
+    /// With `gatt-caching`, the table is complete: its Database Hash is
+    /// computed now.
     pub fn new(att_table: AttributeTable<'values, M, ATT_MAX>) -> AttributeServer<'values, M, P, ATT_MAX, CONN_MAX> {
         let cccd_tables = ClientAttTables::new(&att_table);
+        #[cfg(feature = "gatt-caching")]
+        let (caching, database_hash) = {
+            let caching = CachingHandles::find(&att_table);
+            let hash = att_table.hash();
+            if let Some(handles) = caching {
+                unwrap!(att_table.set_raw(handles.database_hash, &hash.to_le_bytes()));
+            }
+            (caching, hash)
+        };
         AttributeServer {
             att_table,
             client_att_tables: cccd_tables,
+            #[cfg(feature = "gatt-caching")]
+            caching,
+            #[cfg(feature = "gatt-caching")]
+            database_hash,
             _p: PhantomData,
         }
+    }
+
+    /// The Database Hash of the table (Core Spec Vol 3, Part G, Section 7.3).
+    /// An application keeps it with each bonded client's [`ClientCaching`]:
+    /// a different hash after a reset means that the database changed.
+    #[cfg(feature = "gatt-caching")]
+    pub fn database_hash(&self) -> u128 {
+        self.database_hash
+    }
+
+    /// The client's caching state, for the application to keep if the client
+    /// is bonded; `None` without the caching characteristics or the client.
+    #[cfg(feature = "gatt-caching")]
+    pub fn client_caching(&self, connection: &Connection<'_, P>) -> Option<ClientCaching> {
+        let handles = self.caching?;
+        self.client_att_tables
+            .with_client_mut(&connection.peer_identity(), |client, table| ClientCaching {
+                service_changed: table
+                    .get(handles.service_changed_cccd)
+                    .and_then(|value| value.try_into().ok())
+                    .is_some_and(|value| CCCD(u16::from_le_bytes(value)).should_indicate()),
+                supported_features: table
+                    .get(handles.client_features)
+                    .and_then(|value| value.first().copied())
+                    .unwrap_or(0),
+                change_aware: client.caching.change_aware,
+            })
+    }
+
+    /// Restore a bonded client's caching state, as kept from its last
+    /// connection, as soon as it connects: before its requests are
+    /// processed; whether it was. The server keeps a bonded client's
+    /// state across its connections until it needs the slot for another
+    /// client, and state it holds from an earlier connection is newer than
+    /// any copy, so it is kept.
+    #[cfg(feature = "gatt-caching")]
+    pub fn restore_client_caching(&self, connection: &Connection<'_, P>, caching: ClientCaching) -> bool {
+        let Some(handles) = self.caching else {
+            return false;
+        };
+        let cccd: u16 = if caching.service_changed { 0x0002 } else { 0 };
+        self.client_att_tables
+            .with_client_mut(&connection.peer_identity(), |client, table| {
+                if client.caching.held {
+                    return false;
+                }
+                let _ = table.write(handles.service_changed_cccd, 0, &cccd.to_le_bytes());
+                let _ = table.write(handles.client_features, 0, &[caching.supported_features]);
+                client.caching.change_aware = caching.change_aware;
+                client.caching.resync_answered = false;
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Indicate Service Changed for the whole database to the client, if it
+    /// enabled the indication: `Ok(true)` once it confirmed, from when it is
+    /// change-aware. For a bonded client whose cache predates a change to the
+    /// database, once its link is encrypted (Core Spec Vol 3, Part G,
+    /// Sections 2.5.2 and 7.1).
+    #[cfg(feature = "gatt-caching")]
+    pub async fn indicate_service_changed(
+        &self,
+        connection: &crate::gatt::GattConnection<'_, '_, P>,
+    ) -> Result<bool, Error> {
+        let handles = self.caching.ok_or(Error::NotFound)?;
+        let conn = connection.raw();
+        if !self.should_indicate(conn, handles.service_changed_cccd) {
+            return Ok(false);
+        }
+        // Any client may enable it: there is no security to raise first.
+        // Affected handles 0x0001 to 0xFFFF: the client rediscovers all.
+        crate::attribute::send_indication(conn, handles.service_changed, &[0x01, 0x00, 0xff, 0xff]).await?;
+        self.client_att_tables
+            .with_client_mut(&conn.peer_identity(), |client, _| {
+                client.caching.become_aware();
+            });
+        Ok(true)
+    }
+
+    /// Whether notifications and indications other than Service Changed may
+    /// be sent to the client: not while it uses Robust Caching and is
+    /// change-unaware.
+    #[cfg(feature = "gatt-caching")]
+    fn may_send_unsolicited(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
+        let Some(handles) = self.caching else {
+            return true;
+        };
+        cccd_handle == handles.service_changed_cccd
+            || self
+                .client_att_tables
+                .with_client_mut(&connection.peer_identity(), |client, table| {
+                    client.caching.change_aware || !handles.robust(table)
+                })
+                .unwrap_or(true)
     }
 
     /// Read an attribute value with permission checks for the given connection.
@@ -180,6 +474,10 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     pub(crate) fn should_notify(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
+        #[cfg(feature = "gatt-caching")]
+        if !self.may_send_unsolicited(connection, cccd_handle) {
+            return false;
+        }
         self.client_att_tables
             .with_value(&connection.peer_identity(), cccd_handle, |value| {
                 if let Ok(value) = value.try_into() {
@@ -192,6 +490,10 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     pub(crate) fn should_indicate(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
+        #[cfg(feature = "gatt-caching")]
+        if !self.may_send_unsolicited(connection, cccd_handle) {
+            return false;
+        }
         self.client_att_tables
             .with_value(&connection.peer_identity(), cccd_handle, |value| {
                 if let Ok(value) = value.try_into() {
@@ -252,6 +554,20 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     ) -> Result<(), AttErrorCode> {
         self.can_write(connection, att)?;
         if matches!(att.data, AttributeData::ClientSpecific { .. }) {
+            #[cfg(feature = "gatt-caching")]
+            if self.caching.is_some_and(|handles| handles.client_features == handle) {
+                // A client shall not clear a feature bit it has set (Core Spec
+                // Vol 3, Part G, Section 7.2).
+                let mut set = [0u8];
+                let _ = self
+                    .client_att_tables
+                    .read(&connection.peer_identity(), handle, 0, &mut set);
+                if let (0, Some(new)) = (offset, data.first()) {
+                    if set[0] & !new != 0 {
+                        return Err(AttErrorCode::VALUE_NOT_ALLOWED);
+                    }
+                }
+            }
             return self
                 .client_att_tables
                 .write(&connection.peer_identity(), handle, offset, data);
@@ -1180,6 +1496,356 @@ mod tests {
             ));
             assert_eq!(characteristic.should_notify(&conn), notify, "CCCD {cccd:02x?}");
             assert_eq!(characteristic.should_indicate(&conn), indicate, "CCCD {cccd:02x?}");
+        }
+    }
+
+    #[cfg(feature = "gatt-caching")]
+    mod caching {
+        extern crate std;
+
+        use std::boxed::Box;
+
+        use bt_hci::uuid::characteristic::{CLIENT_SUPPORTED_FEATURES, DATABASE_HASH, SERVICE_CHANGED};
+        use bt_hci::uuid::declarations::CHARACTERISTIC;
+        use bt_hci::uuid::descriptors::CLIENT_CHARACTERISTIC_CONFIGURATION;
+        use embassy_futures::block_on;
+        use embassy_futures::join::join;
+
+        use super::*;
+        use crate::connection_manager::ConnectionManager;
+        use crate::gatt::GattConnection;
+
+        const SIZE: usize = GAP_SERVICE_ATTRIBUTE_COUNT + 4;
+        // GAP 1..=5 (with security and central 1..=7), GATT from 6: Service
+        // Changed, Client Supported Features, Database Hash, then a service of
+        // one characteristic that notifies.
+        const GATT: u16 = if cfg!(feature = "central") { 8 } else { 6 };
+        const SERVICE_CHANGED_VALUE: u16 = GATT + 2;
+        const SERVICE_CHANGED_CCCD: u16 = GATT + 3;
+        const CLIENT_FEATURES: u16 = GATT + 5;
+        const DATABASE_HASH_VALUE: u16 = GATT + 7;
+        const ROBUST: ClientCaching = ClientCaching {
+            service_changed: true,
+            supported_features: 1,
+            change_aware: false,
+        };
+        const READ: AttClient<'static> = AttClient::Request(AttReq::Read { handle: 3 });
+
+        type Server = AttributeServer<'static, NoopRawMutex, DefaultPacketPool, SIZE, 1>;
+
+        struct Setup {
+            mgr: &'static ConnectionManager<'static, DefaultPacketPool>,
+            server: &'static Server,
+            characteristic: Characteristic<[u8; 2]>,
+            conn: Connection<'static, DefaultPacketPool>,
+        }
+
+        fn setup_caching() -> Setup {
+            let mut table: AttributeTable<'static, NoopRawMutex, SIZE> = AttributeTable::new();
+            unwrap!(GapConfig::default("trouble").build(&mut table));
+            let characteristic = table
+                .add_service(Service::new(Uuid::new_short(0x180d)))
+                .add_characteristic_small(Uuid::new_short(0x2a37), [CharacteristicProp::Notify], [0u8; 2])
+                .build();
+            let server: &'static Server = Box::leak(Box::new(AttributeServer::new(table)));
+            let mgr = setup();
+            assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_pending());
+            unwrap!(mgr.connect(
+                ConnHandle::new(0),
+                Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1)),
+                LeConnRole::Peripheral,
+                ConnParams::new(),
+            ));
+            let Poll::Ready(conn) = mgr.poll_accept(LeConnRole::Peripheral, &[], None) else {
+                panic!("expected connection to be accepted");
+            };
+            unwrap!(server.connect(&conn));
+            Setup {
+                mgr,
+                server,
+                characteristic,
+                conn,
+            }
+        }
+
+        fn admit(setup: &Setup, packet: &AttClient<'_>) -> Result<(), AttErrorCode> {
+            sealed::DynamicAttributeServer::admit(setup.server, &setup.conn, packet)
+        }
+
+        fn change_aware(setup: &Setup) -> bool {
+            unwrap!(setup.server.client_caching(&setup.conn)).change_aware
+        }
+
+        /// A bonded client's next connection: the server keeps its state.
+        fn reconnect(setup: &Setup) {
+            unwrap!(setup.server.connect(&setup.conn));
+        }
+
+        #[test]
+        fn the_gatt_service_carries_the_caching_characteristics() {
+            let s = setup_caching();
+            let table = s.server.table();
+            assert_eq!(table.uuid(GATT), Some(PRIMARY_SERVICE.into()));
+            assert_eq!(table.uuid(SERVICE_CHANGED_VALUE), Some(SERVICE_CHANGED.into()));
+            assert_eq!(
+                table.uuid(SERVICE_CHANGED_CCCD),
+                Some(CLIENT_CHARACTERISTIC_CONFIGURATION.into())
+            );
+            assert_eq!(table.uuid(CLIENT_FEATURES), Some(CLIENT_SUPPORTED_FEATURES.into()));
+            assert_eq!(table.uuid(DATABASE_HASH_VALUE), Some(DATABASE_HASH.into()));
+            assert_eq!(table.uuid(DATABASE_HASH_VALUE + 1), Some(PRIMARY_SERVICE.into()));
+        }
+
+        #[test]
+        fn the_database_hash_is_readable_little_endian() {
+            let s = setup_caching();
+            let mut buf = [0u8; 32];
+            let len = unwrap!(s.server.handle_read_req(&s.conn, &mut buf, DATABASE_HASH_VALUE));
+            assert_eq!(buf[0], att::ATT_READ_RSP);
+            assert_eq!(&buf[1..len], &s.server.database_hash().to_le_bytes());
+            assert_eq!(s.server.database_hash(), s.server.table().hash());
+        }
+
+        // The GATT service after a GAP service of Device Name and Appearance
+        // is the start of `attribute::tests::database_hash`, whose hash is
+        // known.
+        #[test]
+        fn the_database_hash_of_the_gatt_service_is_known() {
+            use bt_hci::uuid::characteristic::{APPEARANCE, DEVICE_NAME};
+            let mut table: AttributeTable<'static, NoopRawMutex, 13> = AttributeTable::new();
+            let mut gap = table.add_service(Service::new(bt_hci::uuid::service::GAP));
+            gap.add_characteristic_ro(DEVICE_NAME, "trouble");
+            gap.add_characteristic_ro(APPEARANCE, &appearance::UNKNOWN);
+            gap.build();
+            crate::gap::build_gatt_service(&mut table);
+            let server = AttributeServer::<_, DefaultPacketPool, 13, 1>::new(table);
+            assert_eq!(server.database_hash(), 0x16ce756326c5062bf74022f845c2b21f);
+        }
+
+        #[test]
+        fn another_table_has_another_hash() {
+            let s = setup_caching();
+            let mut table: AttributeTable<'static, NoopRawMutex, SIZE> = AttributeTable::new();
+            unwrap!(GapConfig::default("trouble").build(&mut table));
+            table
+                .add_service(Service::new(Uuid::new_short(0x180d)))
+                .add_characteristic_small(Uuid::new_short(0x2a38), [CharacteristicProp::Notify], [0u8; 2])
+                .build();
+            let other = AttributeServer::<_, DefaultPacketPool, SIZE, 1>::new(table);
+            assert_ne!(other.database_hash(), s.server.database_hash());
+        }
+
+        #[test]
+        fn a_new_client_is_change_aware_without_features() {
+            let s = setup_caching();
+            assert_eq!(
+                s.server.client_caching(&s.conn),
+                Some(ClientCaching {
+                    service_changed: false,
+                    supported_features: 0,
+                    change_aware: true,
+                })
+            );
+            assert_eq!(admit(&s, &READ), Ok(()));
+        }
+
+        #[test]
+        fn a_client_sets_its_caching_state_over_the_air() {
+            let s = setup_caching();
+            let mut buf = [0u8; 8];
+            unwrap!(s
+                .server
+                .handle_write_req(&s.conn, &mut buf, SERVICE_CHANGED_CCCD, &[2, 0]));
+            unwrap!(s.server.handle_write_req(&s.conn, &mut buf, CLIENT_FEATURES, &[1]));
+            assert_eq!(
+                s.server.client_caching(&s.conn),
+                Some(ClientCaching {
+                    change_aware: true,
+                    ..ROBUST
+                })
+            );
+        }
+
+        #[test]
+        fn a_kept_state_is_restored() {
+            let s = setup_caching();
+            assert!(s.server.restore_client_caching(&s.conn, ROBUST));
+            assert_eq!(s.server.client_caching(&s.conn), Some(ROBUST));
+        }
+
+        #[test]
+        fn a_state_held_from_an_earlier_connection_is_kept() {
+            let s = setup_caching();
+            let mut buf = [0u8; 8];
+            unwrap!(s
+                .server
+                .handle_write_req(&s.conn, &mut buf, SERVICE_CHANGED_CCCD, &[2, 0]));
+            reconnect(&s);
+            assert!(!s.server.restore_client_caching(&s.conn, ClientCaching::default()));
+            assert!(unwrap!(s.server.client_caching(&s.conn)).service_changed);
+        }
+
+        #[test]
+        fn a_change_unaware_client_is_out_of_sync_once_per_bearer() {
+            let s = setup_caching();
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            // Its commands are ignored: they have no response to refuse them.
+            let command = AttClient::Command(AttCmd::Write { handle: 3, data: &[0] });
+            assert_eq!(admit(&s, &command), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+            assert_eq!(admit(&s, &READ), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+            assert!(!change_aware(&s));
+            // The next request is performed, and the client is change-aware.
+            assert_eq!(admit(&s, &READ), Ok(()));
+            assert!(change_aware(&s));
+            assert_eq!(admit(&s, &command), Ok(()));
+        }
+
+        #[test]
+        fn a_reconnected_client_is_answered_afresh() {
+            let s = setup_caching();
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            assert_eq!(admit(&s, &READ), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+            reconnect(&s);
+            assert_eq!(admit(&s, &READ), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+        }
+
+        #[test]
+        fn reading_the_hash_makes_a_client_change_aware_at_its_next_request() {
+            let s = setup_caching();
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            let hash = |start| {
+                AttClient::Request(AttReq::ReadByType {
+                    start,
+                    end: 0xffff,
+                    attribute_type: DATABASE_HASH.into(),
+                })
+            };
+            // Only over the whole database.
+            assert_eq!(admit(&s, &hash(2)), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+            reconnect(&s);
+            assert_eq!(admit(&s, &hash(1)), Ok(()));
+            assert!(!change_aware(&s));
+            assert_eq!(admit(&s, &READ), Ok(()));
+            assert!(change_aware(&s));
+        }
+
+        #[test]
+        fn discovery_is_performed_for_a_change_unaware_client() {
+            let s = setup_caching();
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            for request in [
+                AttReq::ReadByGroupType {
+                    start: 1,
+                    end: 0xffff,
+                    group_type: PRIMARY_SERVICE.into(),
+                },
+                AttReq::ReadByType {
+                    start: GATT,
+                    end: DATABASE_HASH_VALUE,
+                    attribute_type: CHARACTERISTIC.into(),
+                },
+                AttReq::FindInformation {
+                    start_handle: SERVICE_CHANGED_CCCD,
+                    end_handle: SERVICE_CHANGED_CCCD,
+                },
+                AttReq::FindByTypeValue {
+                    start_handle: 1,
+                    end_handle: 0xffff,
+                    att_type: 0x2800,
+                    att_value: &[0x0d, 0x18],
+                },
+                AttReq::ExchangeMtu { mtu: 247 },
+            ] {
+                assert_eq!(admit(&s, &AttClient::Request(request)), Ok(()));
+            }
+            assert!(!change_aware(&s));
+        }
+
+        #[test]
+        fn without_robust_caching_a_change_unaware_client_is_served() {
+            let s = setup_caching();
+            s.server.restore_client_caching(
+                &s.conn,
+                ClientCaching {
+                    supported_features: 0,
+                    ..ROBUST
+                },
+            );
+            assert_eq!(admit(&s, &READ), Ok(()));
+            assert!(!change_aware(&s));
+        }
+
+        #[test]
+        fn a_change_unaware_client_gets_only_service_changed() {
+            let s = setup_caching();
+            let cccd = unwrap!(s.characteristic.cccd_handle);
+            unwrap!(sealed::DynamicAttributeServer::set(s.server, &s.conn, cccd, &[1, 0]));
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            assert!(!s.server.should_notify(&s.conn, cccd));
+            assert!(s.server.should_indicate(&s.conn, SERVICE_CHANGED_CCCD));
+            assert_eq!(admit(&s, &READ), Err(AttErrorCode::DATABASE_OUT_OF_SYNC));
+            assert_eq!(admit(&s, &READ), Ok(()));
+            assert!(s.server.should_notify(&s.conn, cccd));
+        }
+
+        #[test]
+        fn a_client_cannot_clear_a_feature_it_set() {
+            let s = setup_caching();
+            let mut buf = [0u8; 8];
+            let len = unwrap!(s.server.handle_write_req(&s.conn, &mut buf, CLIENT_FEATURES, &[1]));
+            assert_eq!(&buf[..len], &[att::ATT_WRITE_RSP]);
+            let len = unwrap!(s.server.handle_write_req(&s.conn, &mut buf, CLIENT_FEATURES, &[0]));
+            // Error response: "Value Not Allowed".
+            assert_eq!(
+                &buf[..len],
+                &[att::ATT_ERROR_RSP, att::ATT_WRITE_REQ, CLIENT_FEATURES as u8, 0, 0x13]
+            );
+            assert_eq!(unwrap!(s.server.client_caching(&s.conn)).supported_features, 1);
+        }
+
+        #[test]
+        fn service_changed_is_indicated_for_the_whole_database() {
+            let s = setup_caching();
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            let gatt = unwrap!(GattConnection::try_new(s.conn.clone(), s.server));
+            let peer = async {
+                let (handle, pdu) = s.mgr.outbound().await;
+                // L2CAP header, then Handle Value Indication of Service Changed:
+                // affected handles 0x0001 to 0xFFFF.
+                assert_eq!(
+                    &pdu.as_ref()[4..],
+                    &[
+                        att::ATT_HANDLE_VALUE_IND,
+                        SERVICE_CHANGED_VALUE as u8,
+                        0,
+                        0x01,
+                        0x00,
+                        0xff,
+                        0xff
+                    ]
+                );
+                s.mgr.signal_indication_confirmation(handle);
+            };
+            let (indicated, ()) = block_on(join(s.server.indicate_service_changed(&gatt), peer));
+            assert_eq!(indicated, Ok(true));
+            // Confirmed: the client is change-aware.
+            assert!(change_aware(&s));
+            assert_eq!(admit(&s, &READ), Ok(()));
+        }
+
+        #[test]
+        fn service_changed_is_not_indicated_unasked() {
+            let s = setup_caching();
+            s.server.restore_client_caching(
+                &s.conn,
+                ClientCaching {
+                    service_changed: false,
+                    ..ROBUST
+                },
+            );
+            let gatt = unwrap!(GattConnection::try_new(s.conn.clone(), s.server));
+            assert_eq!(block_on(s.server.indicate_service_changed(&gatt)), Ok(false));
+            assert!(!change_aware(&s));
         }
     }
 }

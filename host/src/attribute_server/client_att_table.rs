@@ -424,6 +424,13 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                 if client.identity.match_identity(peer_identity) {
                     // trace!("[server] found! table = {:?}", *table);
                     client.is_connected = true;
+                    // A new bearer: Robust Caching answers it afresh. What the
+                    // client set on an earlier one stands.
+                    #[cfg(feature = "gatt-caching")]
+                    {
+                        client.caching.resync_answered = false;
+                        client.caching.held = true;
+                    }
                     return Ok(());
                 } else if client.identity == empty_slot {
                     //  trace!("[server] empty slot: connecting");
@@ -437,9 +444,10 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
             for (client, table) in n.iter_mut() {
                 if !client.is_connected {
                     trace!("[server] booting disconnected peer {:?}", client.identity);
+                    // erase the previous client's config
+                    *client = Client::default();
                     client.is_connected = true;
                     client.set_identity(*peer_identity);
-                    // erase the previous client's config
                     table.clear();
                     return Ok(());
                 }
@@ -465,6 +473,20 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                     break;
                 }
             }
+        })
+    }
+
+    #[cfg(feature = "gatt-caching")]
+    pub(crate) fn with_client_mut<R>(
+        &self,
+        peer_identity: &Identity,
+        f: impl FnOnce(&mut Client, &mut ClientAttTable) -> R,
+    ) -> Option<R> {
+        self.state.lock(|n| {
+            let mut n = n.borrow_mut();
+            n.iter_mut()
+                .find(|(client, _)| client.identity.match_identity(peer_identity))
+                .map(|(client, table)| f(client, table))
         })
     }
 

@@ -448,6 +448,13 @@ impl<'stack, 'server, P: PacketPool> GattEvent<'stack, 'server, P> {
     pub fn new(data: GattData<'stack, P>, server: &'server dyn DynamicAttributeServer<P>) -> Self {
         let att = data.incoming();
 
+        // A client that a change to the database left with a stale cache is
+        // stopped first: its handles may name other attributes now.
+        #[cfg(feature = "gatt-caching")]
+        if let Err(err) = server.admit(&data.connection, &att) {
+            return GattEvent::NotAllowed(NotAllowedEvent { data, err, server });
+        }
+
         let allowed = match &att {
             AttClient::Command(AttCmd::Write { handle, .. }) => server.can_write(&data.connection, *handle),
             AttClient::Request(req) => match req {
@@ -839,11 +846,15 @@ impl<P: PacketPool> defmt::Format for NotAllowedEvent<'_, '_, P> {
 }
 
 impl<'stack, P: PacketPool> NotAllowedEvent<'stack, '_, P> {
-    /// Characteristic handle that was requested
+    /// Characteristic handle that was requested, or 0 for a request without
+    /// one (one refused with Database Out Of Sync).
     pub fn handle(&self) -> u16 {
-        // We know that the unwrap cannot fail, because `NotAllowedEvent` wraps
-        // ATT payloads that always do have a handle
-        unwrap!(self.data.handle())
+        self.data.handle().unwrap_or(0)
+    }
+
+    /// Why the event is not allowed.
+    pub fn error(&self) -> AttErrorCode {
+        self.err
     }
 
     /// Accept the event, making it processed by the server.

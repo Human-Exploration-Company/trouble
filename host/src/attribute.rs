@@ -726,6 +726,31 @@ impl<'d, M: RawMutex, const MAX: usize> AttributeTable<'d, M, MAX> {
     }
 }
 
+/// Indicate `value` of the attribute at `handle` and wait for the peer's confirmation, once the
+/// peer may receive it.
+pub(crate) async fn send_indication<P: PacketPool>(
+    conn: &crate::connection::Connection<'_, P>,
+    handle: u16,
+    value: &[u8],
+) -> Result<(), Error> {
+    conn.acquire_indication_slot().await?;
+    let _drop = crate::host::OnDrop::new(|| conn.release_indication_slot());
+
+    let uns = AttUns::Indicate { handle, data: value };
+    let pdu = gatt::assemble(conn, crate::att::AttServer::Unsolicited(uns))?;
+    conn.send(pdu).await;
+
+    match with_timeout(ATT_TRANSACTION_TIMEOUT, conn.wait_indication_confirmation()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            warn!("[gatt] ATT transaction timeout (30s) waiting for indication confirmation, disconnecting");
+            conn.disconnect();
+            Err(Error::Timeout)
+        }
+    }
+}
+
 /// A type which holds a handle to an attribute in the attribute table
 pub trait AttributeHandle {
     /// The data type which the attribute contains
@@ -1148,26 +1173,7 @@ impl<T: AsGatt + ?Sized> Characteristic<T> {
         }
 
         self.authorize_unsolicited(connection, cccd_handle).await?;
-
-        conn.acquire_indication_slot().await?;
-        let _drop = crate::host::OnDrop::new(|| conn.release_indication_slot());
-
-        let uns = AttUns::Indicate {
-            handle: self.handle,
-            data: value,
-        };
-        let pdu = gatt::assemble(conn, crate::att::AttServer::Unsolicited(uns))?;
-        conn.send(pdu).await;
-
-        match with_timeout(ATT_TRANSACTION_TIMEOUT, conn.wait_indication_confirmation()).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                warn!("[gatt] ATT transaction timeout (30s) waiting for indication confirmation, disconnecting");
-                conn.disconnect();
-                Err(Error::Timeout)
-            }
-        }
+        send_indication(conn, self.handle, value).await
     }
 
     /// Set the value of the characteristic in the provided attribute server.

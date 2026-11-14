@@ -145,6 +145,44 @@ level.indicate(&conn, &new_value, true).await?;
 
 NOTE: Notifications/indications will only be delivered if the client has enabled them by writing to the characteristic's CCCD (Client Characteristic Configuration Descriptor).
 
+=== GATT Caching
+
+A client may keep the attribute table it discovered and reuse it on later connections.
+Without the `gatt-caching` feature the GATT service is empty, and a client may assume that the table never changes: after a firmware update that changes it, the client keeps using the handles it cached.
+
+With `gatt-caching`, the GATT service carries Service Changed, Client Supported Features and Database Hash (Core Spec Vol 3, Part G, Section 7), and the server implements Robust Caching (Section 2.5.2.1):
+
+* A client without a bond rediscovers the table on every connection, since Service Changed exists.
+* A client with Robust Caching that the server knows to be change-unaware is answered Database Out Of Sync, its commands are ignored, and it receives no notification or indication but Service Changed, until it reads the Database Hash or has been answered once.
+* The Database Hash is computed when the server is created, and tells a client that compares it whether its cache is current.
+
+A bonded client's state must survive reconnections and resets, so the application keeps it with the bond:
+
+[source,rust]
+----
+// When the bonded client connects, before its requests are processed.
+// `kept_hash` is the Database Hash the client last knew.
+server.restore_client_caching(
+    conn.raw(),
+    ClientCaching {
+        service_changed: kept.service_changed,
+        supported_features: kept.supported_features,
+        change_aware: kept_hash == server.database_hash(),
+    },
+);
+
+// Once the link is encrypted: tell a change-unaware client that everything changed.
+// Ok(true) once it confirmed, from when it is change-aware.
+server.indicate_service_changed(&conn).await?;
+
+// Whenever it may have changed (the client wrote its Service Changed CCCD or its
+// supported features, or became change-aware), keep the new state, with the
+// current hash if the client is change-aware.
+if let Some(caching) = server.client_caching(conn.raw()) {
+    // persist `caching` and, if `caching.change_aware`, `server.database_hash()`
+}
+----
+
 == The GATT Client
 
 The GATT client is used from the central role to discover and interact with services on a connected peripheral.
