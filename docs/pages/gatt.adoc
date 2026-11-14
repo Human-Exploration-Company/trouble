@@ -170,6 +170,7 @@ const _: () = assert!(trouble_host::gap::SERVICE_CHANGED_VALUE_HANDLE == 8);
 The server holds each client's state in one of the `connections_max` slots of `#[gatt_server]` (1 by default).
 A disconnected bonded client keeps its slot until its bond is removed, or until a new client finds every slot taken and takes the slot of a disconnected one.
 To keep every bonded client's slot, make `connections_max` the number of bonds plus the number of links that can be open at once.
+A client that pairs again with the identity of a bond begins a new one: when `GattConnection::next` returns `PairingComplete` with a bond, the server drops the Service Changed CCCD and supported features the client set under the old bond, keeping what it wrote on this connection, and the client is change-aware.
 
 A bonded client's state must survive reconnections and resets, so the application keeps it with the bond:
 

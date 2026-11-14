@@ -42,6 +42,13 @@ struct CachingState {
     /// The server has held this state since an earlier connection: it is
     /// newer than any copy the application kept.
     held: bool,
+    /// The state comes from a bond made before this connection: held by the
+    /// server or restored by the application.
+    from_bond: bool,
+    /// The client wrote its Service Changed CCCD on this connection.
+    service_changed_written: bool,
+    /// The client wrote its Client Supported Features on this connection.
+    features_written: bool,
 }
 
 #[cfg(feature = "gatt-caching")]
@@ -52,6 +59,9 @@ impl Default for CachingState {
             change_aware: true,
             resync_answered: false,
             held: false,
+            from_bond: false,
+            service_changed_written: false,
+            features_written: false,
         }
     }
 }
@@ -224,6 +234,10 @@ pub(crate) mod sealed {
         /// Caching decides; called once for each, before it is performed.
         #[cfg(feature = "gatt-caching")]
         fn admit(&self, connection: &Connection<'_, P>, packet: &AttClient) -> Result<(), AttErrorCode>;
+
+        /// The client of `identity` has paired and bonded again.
+        #[cfg(feature = "gatt-caching")]
+        fn bond_added(&self, identity: &Identity);
     }
 }
 
@@ -302,6 +316,11 @@ impl<M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: usize> se
 
     fn update_identity(&self, identity: Identity) -> Result<(), Error> {
         self.client_att_tables.update_identity(identity)
+    }
+
+    #[cfg(feature = "gatt-caching")]
+    fn bond_added(&self, identity: &Identity) {
+        AttributeServer::bond_added(self, identity)
     }
 
     fn can_read(&self, connection: &Connection<'_, P>, handle: u16) -> Result<(), AttErrorCode> {
@@ -437,9 +456,43 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
                 let _ = table.write(handles.client_features, 0, &features[..len]);
                 client.caching.change_aware = caching.change_aware;
                 client.caching.resync_answered = false;
+                client.caching.from_bond = true;
+                client.caching.service_changed_written = false;
+                client.caching.features_written = false;
                 true
             })
             .unwrap_or(false)
+    }
+
+    /// A new bond replaces the one the client's caching state came from: a
+    /// new trusted relationship, so what the client set under the old bond
+    /// and has not set again on this connection is dropped, and the client
+    /// is change-aware (Core Spec Vol 3, Part G, Sections 2.5.2.1 and 7.2).
+    /// What it wrote on this connection before pairing again stands.
+    #[cfg(feature = "gatt-caching")]
+    fn bond_added(&self, identity: &Identity) {
+        let Some(handles) = self.caching else {
+            return;
+        };
+        self.client_att_tables.with_client_mut(identity, |client, table| {
+            let state = &mut client.caching;
+            if !state.from_bond {
+                return;
+            }
+            if !state.service_changed_written {
+                let _ = table.write(handles.service_changed_cccd, 0, &[0, 0]);
+            }
+            if !state.features_written {
+                let _ = table.write(handles.client_features, 0, &[]);
+            }
+            // Any copy the application kept is of the old bond.
+            *state = CachingState {
+                held: true,
+                service_changed_written: state.service_changed_written,
+                features_written: state.features_written,
+                ..CachingState::default()
+            };
+        });
     }
 
     /// Indicate Service Changed for the whole database to the client, if it
@@ -596,9 +649,22 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
                     return Err(AttErrorCode::VALUE_NOT_ALLOWED);
                 }
             }
-            return self
-                .client_att_tables
-                .write(&connection.peer_identity(), handle, offset, data);
+            self.client_att_tables
+                .write(&connection.peer_identity(), handle, offset, data)?;
+            #[cfg(feature = "gatt-caching")]
+            if let Some(handles) = self.caching {
+                if handle == handles.service_changed_cccd || handle == handles.client_features {
+                    self.client_att_tables
+                        .with_client_mut(&connection.peer_identity(), |client, _| {
+                            if handle == handles.service_changed_cccd {
+                                client.caching.service_changed_written = true;
+                            } else {
+                                client.caching.features_written = true;
+                            }
+                        });
+                }
+            }
+            return Ok(());
         }
         att.write(offset, data)
     }
@@ -1672,9 +1738,7 @@ mod tests {
         fn answer(s: &Setup, bytes: &[u8]) -> Option<std::vec::Vec<u8>> {
             let data = crate::gatt::GattData::new(pdu(bytes), s.conn.clone());
             let reply = unwrap!(crate::gatt::GattEvent::new(data, s.server).accept());
-            let answer = reply.att_payload().map(|payload| payload.to_vec());
-            core::mem::forget(reply);
-            answer
+            reply.consume_att_payload(|payload| payload.map(|payload| payload.to_vec()))
         }
 
         #[test]
@@ -1947,6 +2011,65 @@ mod tests {
             assert_eq!(
                 unwrap!(s.server.client_caching(&s.conn)).supported_features,
                 [3, 2, 0, 4]
+            );
+        }
+
+        /// The client pairs and bonds again.
+        fn bond_again(s: &Setup) {
+            sealed::DynamicAttributeServer::bond_added(s.server, &s.conn.peer_identity());
+        }
+
+        #[test]
+        fn a_new_bond_drops_what_the_client_set_under_the_old_one() {
+            let s = setup_caching();
+            subscribe(&s, &s.conn);
+            reconnect(&s);
+            bond_again(&s);
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
+            // Fewer features than under the old bond.
+            assert_eq!(write_features(&s, &[0]), None);
+            // The application's copy is of the old bond.
+            assert!(!s.server.restore_client_caching(&s.conn, ROBUST));
+        }
+
+        #[test]
+        fn a_new_bond_drops_a_restored_state() {
+            let s = setup_caching();
+            assert!(s.server.restore_client_caching(&s.conn, ROBUST));
+            bond_again(&s);
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
+        }
+
+        #[test]
+        fn a_new_bond_keeps_what_the_client_wrote_on_this_connection() {
+            let s = setup_caching();
+            subscribe(&s, &s.conn);
+            reconnect(&s);
+            let mut buf = [0u8; 8];
+            unwrap!(s
+                .server
+                .handle_write_req(&s.conn, &mut buf, SERVICE_CHANGED_CCCD, &[2, 0]));
+            bond_again(&s);
+            assert_eq!(
+                s.server.client_caching(&s.conn),
+                Some(ClientCaching {
+                    service_changed: true,
+                    ..NEW
+                })
+            );
+        }
+
+        #[test]
+        fn a_first_bond_keeps_what_the_client_set_before_pairing() {
+            let s = setup_caching();
+            subscribe(&s, &s.conn);
+            bond_again(&s);
+            assert_eq!(
+                s.server.client_caching(&s.conn),
+                Some(ClientCaching {
+                    change_aware: true,
+                    ..ROBUST
+                })
             );
         }
 

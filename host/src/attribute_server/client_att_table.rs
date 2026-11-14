@@ -446,6 +446,9 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                 {
                     client.caching.resync_answered = false;
                     client.caching.held = true;
+                    client.caching.from_bond = true;
+                    client.caching.service_changed_written = false;
+                    client.caching.features_written = false;
                 }
                 return Ok(());
             }
@@ -584,6 +587,11 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
                 if client.identity.match_identity(peer_identity) {
                     trace!("Setting client attribute table {:?} for {:?}", table, peer_identity);
                     t.set_values(table);
+                    // The application restores what it kept of a bond.
+                    #[cfg(feature = "gatt-caching")]
+                    {
+                        client.caching.from_bond = true;
+                    }
                     break;
                 }
             }

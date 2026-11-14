@@ -299,6 +299,10 @@ impl<'stack, 'server, P: PacketPool> GattConnection<'stack, 'server, P> {
 
                 #[cfg(feature = "security")]
                 ConnectionEvent::PairingComplete { security_level, bond } => {
+                    #[cfg(feature = "gatt-caching")]
+                    if let Some(bond) = &bond {
+                        self.server.bond_added(&bond.identity);
+                    }
                     GattConnectionEvent::PairingComplete { security_level, bond }
                 }
 
@@ -1073,6 +1077,12 @@ impl<'stack, P: PacketPool> Reply<'stack, P> {
     /// Returns None if the reply carried no PDU.
     pub(crate) fn att_payload(&self) -> Option<&[u8]> {
         self.pdu.as_ref().map(|pdu| &pdu.as_ref()[4..])
+    }
+
+    /// Hand the ATT payload to `f`, then release the packet without sending it.
+    pub(crate) fn consume_att_payload<R>(mut self, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
+        let pdu = self.pdu.take();
+        f(pdu.as_ref().map(|pdu| &pdu.as_ref()[4..]))
     }
 }
 
