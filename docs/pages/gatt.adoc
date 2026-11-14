@@ -152,9 +152,24 @@ Without the `gatt-caching` feature the GATT service is empty, and a client may a
 
 With `gatt-caching`, the GATT service carries Service Changed, Client Supported Features and Database Hash (Core Spec Vol 3, Part G, Section 7), and the server implements Robust Caching (Section 2.5.2.1):
 
-* A client without a bond rediscovers the table on every connection, since Service Changed exists.
-* A client with Robust Caching that the server knows to be change-unaware is answered Database Out Of Sync, its commands are ignored, and it receives no notification or indication but Service Changed, until it reads the Database Hash or has been answered once.
+* A client without a bond may not trust a cache across connections, since Service Changed exists: it rediscovers, or checks its cache against the Database Hash.
+* A client with Robust Caching that the server knows to be change-unaware is answered Database Out Of Sync, naming the handle of its request, its commands are ignored, and it receives no notification or indication but Service Changed, until it reads the Database Hash or has been answered once.
 * The Database Hash is computed when the server is created, and tells a client that compares it whether its cache is current.
+* Client Supported Features is up to 4 octets long; a client writes as many as it knows, octets it leaves out read as zero, and a write that would clear a bit the client set, a shorter or empty one included, is refused with Value Not Allowed.
+
+The Service Changed handle must never change while any client is bonded (Section 7.1): a bonded client keeps it to learn that everything else moved.
+`#[gatt_server]` puts the GAP service first and the GATT service after it, so Service Changed is at `gap::SERVICE_CHANGED_VALUE_HANDLE`: 8, or 10 with both `central` and `security`, whose Central Address Resolution characteristic moves the GATT service from handle 6 to 8.
+Toggling `central` together with `security`, or `gatt-caching`, between two versions of a device's firmware therefore moves it, and its bonded clients are never told; such a change must drop the bonds.
+A device can guard the handle at compile time:
+
+[source,rust]
+----
+const _: () = assert!(trouble_host::gap::SERVICE_CHANGED_VALUE_HANDLE == 8);
+----
+
+The server holds each client's state in one of the `connections_max` slots of `#[gatt_server]` (1 by default).
+A disconnected bonded client keeps its slot until its bond is removed, or until a new client finds every slot taken and takes the slot of a disconnected one.
+To keep every bonded client's slot, make `connections_max` the number of bonds plus the number of links that can be open at once.
 
 A bonded client's state must survive reconnections and resets, so the application keeps it with the bond:
 

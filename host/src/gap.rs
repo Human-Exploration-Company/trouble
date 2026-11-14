@@ -37,6 +37,21 @@ const GATT_CACHING_ATTRIBUTE_COUNT: usize = 7;
 #[cfg(not(feature = "gatt-caching"))]
 const GATT_CACHING_ATTRIBUTE_COUNT: usize = 0;
 
+/// The handle of the Service Changed characteristic value when the table
+/// starts with the GAP and GATT services, as `#[gatt_server]` builds it: 8,
+/// or 10 with `security` and `central`. It shall not change while the
+/// server has a trusted relationship with any client (Core Spec Vol 3,
+/// Part G, Section 7.1), so neither may the features that size the GAP
+/// service.
+#[cfg(feature = "gatt-caching")]
+pub const SERVICE_CHANGED_VALUE_HANDLE: u16 = (GAP_SERVICE_ATTRIBUTE_COUNT - GATT_CACHING_ATTRIBUTE_COUNT) as u16 + 2;
+
+/// The length of the Client Supported Features value the server keeps for
+/// each client: octet 0 holds every bit the specification defines (Core
+/// Spec Vol 3, Part G, Section 7.2).
+#[cfg(feature = "gatt-caching")]
+pub const CLIENT_SUPPORTED_FEATURES_LEN: usize = 4;
+
 /// Configuration for the GAP Service.
 pub enum GapConfig<'a> {
     /// Peripheral device configuration.
@@ -151,7 +166,8 @@ pub(crate) fn build_gatt_service<M: RawMutex, const MAX: usize>(table: &mut Attr
             [CharacteristicProp::Indicate],
             [0u8; 4],
         );
-        gatt_builder.add_characteristic_client::<u8, _, _>(
+        // Variable length: a client writes as many octets as it knows of.
+        gatt_builder.add_characteristic_client::<heapless::Vec<u8, CLIENT_SUPPORTED_FEATURES_LEN>, _, _>(
             characteristic::CLIENT_SUPPORTED_FEATURES,
             [CharacteristicProp::Read, CharacteristicProp::Write],
         );

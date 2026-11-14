@@ -1982,6 +1982,78 @@ mod tests {
         );
     }
 
+    /// The example of Core Spec Vol 3, Part G, Appendix B: GAP and GATT
+    /// services, a Glucose service that includes a secondary Battery
+    /// service, and a characteristic with extended properties; the expected
+    /// hash is the specification's. Its message:
+    ///
+    /// 0100 0028 0018
+    /// 0200 0328 0a 0300 002a
+    /// 0400 0328 02 0500 012a
+    /// 0600 0028 0118
+    /// 0700 0328 20 0800 052a
+    /// 0900 0229
+    /// 0a00 0328 0a 0b00 292b
+    /// 0c00 0328 02 0d00 2a2b
+    /// 0e00 0028 0818
+    /// 0f00 0228 1400 1600 0f18
+    /// 1000 0328 a2 1100 182a
+    /// 1200 0229
+    /// 1300 0029 0000
+    /// 1400 0128 0f18
+    /// 1500 0328 02 1600 192a
+    #[cfg(feature = "security")]
+    #[test]
+    fn database_hash_of_the_specification_example() {
+        use bt_hci::uuid::declarations::{CHARACTERISTIC, INCLUDE, PRIMARY_SERVICE, SECONDARY_SERVICE};
+        use bt_hci::uuid::descriptors::{CHARACTERISTIC_EXTENDED_PROPERTIES, CLIENT_CHARACTERISTIC_CONFIGURATION};
+        use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+        use super::CharacteristicProp::{Extended, Indicate, Read, Write};
+        use super::*;
+
+        let ro = AttPermissions::read_only();
+        let mut table: AttributeTable<'static, NoopRawMutex, 22> = AttributeTable::new();
+        let service = |table: &mut AttributeTable<'static, NoopRawMutex, 22>, kind, uuid: u16| {
+            table.push(Attribute::new(kind, ro, Uuid::new_short(uuid)));
+        };
+        // A declaration, then its value.
+        let characteristic =
+            |table: &mut AttributeTable<'static, NoopRawMutex, 22>, props: &[CharacteristicProp], value, uuid| {
+                let declaration = CharacteristicDeclaration::new(props, value, Uuid::new_short(uuid));
+                table.push(Attribute::new(CHARACTERISTIC, ro, declaration));
+                let data = AttributeData::ReadOnlyData { value: b"" };
+                assert_eq!(table.push(Attribute::new(Uuid::new_short(uuid), ro, data)), value);
+            };
+        let descriptor = |table: &mut AttributeTable<'static, NoopRawMutex, 22>, uuid, value: &'static [u8]| {
+            table.push(Attribute::new(uuid, ro, AttributeData::ReadOnlyData { value }));
+        };
+
+        service(&mut table, PRIMARY_SERVICE, 0x1800);
+        characteristic(&mut table, &[Read, Write], 0x0003, 0x2a00);
+        characteristic(&mut table, &[Read], 0x0005, 0x2a01);
+        service(&mut table, PRIMARY_SERVICE, 0x1801);
+        characteristic(&mut table, &[Indicate], 0x0008, 0x2a05);
+        descriptor(&mut table, CLIENT_CHARACTERISTIC_CONFIGURATION, b"");
+        characteristic(&mut table, &[Read, Write], 0x000b, 0x2b29);
+        characteristic(&mut table, &[Read], 0x000d, 0x2b2a);
+        service(&mut table, PRIMARY_SERVICE, 0x1808);
+        // The Battery service at 0x0014 to 0x0016.
+        descriptor(&mut table, INCLUDE, &[0x14, 0x00, 0x16, 0x00, 0x0f, 0x18]);
+        characteristic(&mut table, &[Read, Indicate, Extended], 0x0011, 0x2a18);
+        descriptor(&mut table, CLIENT_CHARACTERISTIC_CONFIGURATION, b"");
+        descriptor(&mut table, CHARACTERISTIC_EXTENDED_PROPERTIES, &[0x00, 0x00]);
+        service(&mut table, SECONDARY_SERVICE, 0x180f);
+        characteristic(&mut table, &[Read], 0x0016, 0x2a19);
+
+        let expected = 0xF1CA2D48ECF58BAC8A8830BBB9FBA990;
+        let actual = table.hash();
+        assert_eq!(
+            actual, expected,
+            "\nexpected: {expected:#034x}\n  actual: {actual:#034x}"
+        );
+    }
+
     #[test]
     fn set_updates_variable_length_when_value_fills_backing_storage() {
         use embassy_sync::blocking_mutex::raw::NoopRawMutex;

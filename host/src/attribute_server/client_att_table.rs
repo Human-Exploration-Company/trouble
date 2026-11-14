@@ -415,29 +415,44 @@ impl<M: RawMutex, const CONN_MAX: usize> ClientAttTables<M, CONN_MAX> {
         }
     }
 
-    pub(crate) fn connect(&self, peer_identity: &Identity) -> Result<(), Error> {
+    /// Give the connecting peer its slot: the one it held, if its bond lasts,
+    /// or a fresh one. `bonded` tells whether the stack holds a bond with an
+    /// identity.
+    pub(crate) fn connect(&self, peer_identity: &Identity, bonded: impl Fn(&Identity) -> bool) -> Result<(), Error> {
         self.state.lock(|n| {
             trace!("[server] searching for peer {:?}", peer_identity);
             let mut n = n.borrow_mut();
             let empty_slot = Identity::default();
+            // A slot is held for a disconnected peer only while its bond
+            // lasts: one removed since (evicted, forgotten, lost) leaves
+            // nothing for the peer's next connection, nor for anyone else.
             for (client, table) in n.iter_mut() {
-                if client.identity.match_identity(peer_identity) {
-                    // trace!("[server] found! table = {:?}", *table);
-                    client.is_connected = true;
-                    // A new bearer: Robust Caching answers it afresh. What the
-                    // client set on an earlier one stands.
-                    #[cfg(feature = "gatt-caching")]
-                    {
-                        client.caching.resync_answered = false;
-                        client.caching.held = true;
-                    }
-                    return Ok(());
-                } else if client.identity == empty_slot {
-                    //  trace!("[server] empty slot: connecting");
-                    client.is_connected = true;
-                    client.set_identity(*peer_identity);
-                    return Ok(());
+                if !client.is_connected && client.identity != empty_slot && !bonded(&client.identity) {
+                    trace!("[server] releasing the slot of unbonded peer {:?}", client.identity);
+                    *client = Client::default();
+                    table.clear();
                 }
+            }
+            // The peer's own slot first, wherever it is: an empty one before
+            // it must not take its place.
+            if let Some((client, _)) = n
+                .iter_mut()
+                .find(|(client, _)| client.identity.match_identity(peer_identity))
+            {
+                client.is_connected = true;
+                // A new bearer: Robust Caching answers it afresh. What the
+                // client set on an earlier one stands.
+                #[cfg(feature = "gatt-caching")]
+                {
+                    client.caching.resync_answered = false;
+                    client.caching.held = true;
+                }
+                return Ok(());
+            }
+            if let Some((client, _)) = n.iter_mut().find(|(client, _)| client.identity == empty_slot) {
+                client.is_connected = true;
+                client.set_identity(*peer_identity);
+                return Ok(());
             }
             trace!("[server] all slots full...");
             // if we got here all slots are full; replace the first disconnected client

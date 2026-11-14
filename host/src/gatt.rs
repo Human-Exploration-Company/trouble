@@ -846,10 +846,12 @@ impl<P: PacketPool> defmt::Format for NotAllowedEvent<'_, '_, P> {
 }
 
 impl<'stack, P: PacketPool> NotAllowedEvent<'stack, '_, P> {
-    /// Characteristic handle that was requested, or 0 for a request without
-    /// one (one refused with Database Out Of Sync).
+    /// The handle the error response names: the one requested, the start of
+    /// a requested range (a request refused with Database Out Of Sync), or 0.
     pub fn handle(&self) -> u16 {
-        self.data.handle().unwrap_or(0)
+        self.data
+            .handle()
+            .unwrap_or_else(|| handle_in_error(&self.data.incoming()))
     }
 
     /// Why the event is not allowed.
@@ -979,17 +981,40 @@ fn process_reject<'stack, P: PacketPool>(
     if let AttClient::Request(AttReq::ExecuteWrite { .. }) = &att {
         connection.clear_prepare_write();
     }
-    let handle = match att {
-        AttClient::Request(AttReq::Write { handle, .. }) => handle,
-        AttClient::Request(AttReq::Read { handle }) => handle,
-        AttClient::Request(AttReq::ReadBlob { handle, .. }) => handle,
-        _ => 0, // As per spec, if the incoming ATT does not have an ATT handle, we should report with handle 0
-    };
+    let handle = handle_in_error(&att);
     // We know it has been checked, therefore this cannot fail
     let request = pdu.as_ref()[0];
     let rsp = AttRsp::Error { request, handle, code };
     let pdu = assemble(connection, AttServer::Response(rsp))?;
     Ok(Reply::new(connection.clone(), Some(pdu)))
+}
+
+/// The Attribute Handle In Error of an error response to `att`: the handle
+/// it names, the start of the range it names, or the first of the handles
+/// it names; 0 if it names none (Core Spec Vol 3, Part F, Section 3.4.1.1).
+fn handle_in_error(att: &AttClient<'_>) -> u16 {
+    match att {
+        AttClient::Request(
+            AttReq::Write { handle, .. }
+            | AttReq::Read { handle }
+            | AttReq::ReadBlob { handle, .. }
+            | AttReq::PrepareWrite { handle, .. },
+        ) => *handle,
+        AttClient::Request(
+            AttReq::ReadByType { start, .. }
+            | AttReq::ReadByGroupType { start, .. }
+            | AttReq::FindInformation {
+                start_handle: start, ..
+            }
+            | AttReq::FindByTypeValue {
+                start_handle: start, ..
+            },
+        ) => *start,
+        AttClient::Request(AttReq::ReadMultiple { handles }) => {
+            handles.first_chunk::<2>().map_or(0, |first| u16::from_le_bytes(*first))
+        }
+        _ => 0,
+    }
 }
 
 pub(crate) fn assemble<'stack, P: PacketPool>(
@@ -1046,7 +1071,7 @@ impl<'stack, P: PacketPool> Reply<'stack, P> {
 impl<'stack, P: PacketPool> Reply<'stack, P> {
     /// Extract the ATT payload from the response PDU (skipping 4-byte L2CAP header).
     /// Returns None if the reply carried no PDU.
-    fn att_payload(&self) -> Option<&[u8]> {
+    pub(crate) fn att_payload(&self) -> Option<&[u8]> {
         self.pdu.as_ref().map(|pdu| &pdu.as_ref()[4..])
     }
 }

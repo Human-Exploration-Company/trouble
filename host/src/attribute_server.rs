@@ -103,6 +103,29 @@ impl CachingHandles {
     }
 }
 
+/// Whether writing `data` at `offset` over the Client Supported Features
+/// value `set` clears a bit the client has set, which it shall not (Core
+/// Spec Vol 3, Part G, Section 7.2). The value after the write is `set` up
+/// to `offset`, then `data`, and the octets it leaves out are zero: a
+/// shorter value clears their bits. So a zero-length write is the all-zero
+/// value. The specification gives the value no minimum length and an
+/// all-zero default, so that write is accepted until the client sets a bit,
+/// and refused after. A write the table refuses anyway (an offset past the
+/// value, a value too long) is left to it.
+#[cfg(feature = "gatt-caching")]
+fn clears_a_feature(set: &[u8], offset: usize, data: &[u8]) -> bool {
+    if offset > set.len() {
+        return false;
+    }
+    set.iter().enumerate().any(|(i, &bits)| {
+        let new = match i.checked_sub(offset) {
+            None => bits,
+            Some(i) => data.get(i).copied().unwrap_or(0),
+        };
+        bits & !new != 0
+    })
+}
+
 /// What a change-unaware client's request does (Core Spec Vol 3, Part G,
 /// Section 2.5.2.1).
 #[cfg(feature = "gatt-caching")]
@@ -157,8 +180,9 @@ impl Resync {
 pub struct ClientCaching {
     /// The client's Service Changed CCCD enables indications.
     pub service_changed: bool,
-    /// The client's Client Supported Features value.
-    pub supported_features: u8,
+    /// The client's Client Supported Features value, octet 0 first; octets it
+    /// did not write are zero.
+    pub supported_features: [u8; crate::gap::CLIENT_SUPPORTED_FEATURES_LEN],
     /// The client knows the current database: it is change-aware. Restore
     /// `false` for a client whose cache predates a change to the database.
     pub change_aware: bool,
@@ -378,20 +402,23 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
                     .get(handles.service_changed_cccd)
                     .and_then(|value| value.try_into().ok())
                     .is_some_and(|value| CCCD(u16::from_le_bytes(value)).should_indicate()),
-                supported_features: table
-                    .get(handles.client_features)
-                    .and_then(|value| value.first().copied())
-                    .unwrap_or(0),
+                supported_features: {
+                    let mut features = [0; crate::gap::CLIENT_SUPPORTED_FEATURES_LEN];
+                    let value = table.get(handles.client_features).unwrap_or(&[]);
+                    features[..value.len()].copy_from_slice(value);
+                    features
+                },
                 change_aware: client.caching.change_aware,
             })
     }
 
     /// Restore a bonded client's caching state, as kept from its last
-    /// connection, as soon as it connects: before its requests are
-    /// processed; whether it was. The server keeps a bonded client's
-    /// state across its connections until it needs the slot for another
-    /// client, and state it holds from an earlier connection is newer than
-    /// any copy, so it is kept.
+    /// connection. Call it when the client connects, before its requests are
+    /// processed. Returns whether the state was restored: the server keeps a
+    /// bonded client's state across its connections while the bond lasts and
+    /// the slot is not needed for another client, and state it holds from an
+    /// earlier connection is newer than any copy, so it keeps that and
+    /// returns `false`.
     #[cfg(feature = "gatt-caching")]
     pub fn restore_client_caching(&self, connection: &Connection<'_, P>, caching: ClientCaching) -> bool {
         let Some(handles) = self.caching else {
@@ -404,7 +431,10 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
                     return false;
                 }
                 let _ = table.write(handles.service_changed_cccd, 0, &cccd.to_le_bytes());
-                let _ = table.write(handles.client_features, 0, &[caching.supported_features]);
+                // As written: up to the last octet with a bit set.
+                let features = &caching.supported_features;
+                let len = features.iter().rposition(|&octet| octet != 0).map_or(0, |i| i + 1);
+                let _ = table.write(handles.client_features, 0, &features[..len]);
                 client.caching.change_aware = caching.change_aware;
                 client.caching.resync_answered = false;
                 true
@@ -470,7 +500,9 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
     }
 
     pub(crate) fn connect(&self, connection: &Connection<'_, P>) -> Result<(), Error> {
-        self.client_att_tables.connect(&connection.peer_identity())
+        self.client_att_tables.connect(&connection.peer_identity(), |identity| {
+            connection.is_bonded_identity(identity)
+        })
     }
 
     pub(crate) fn should_notify(&self, connection: &Connection<'_, P>, cccd_handle: u16) -> bool {
@@ -556,16 +588,12 @@ impl<'values, M: RawMutex, P: PacketPool, const ATT_MAX: usize, const CONN_MAX: 
         if matches!(att.data, AttributeData::ClientSpecific { .. }) {
             #[cfg(feature = "gatt-caching")]
             if self.caching.is_some_and(|handles| handles.client_features == handle) {
-                // A client shall not clear a feature bit it has set (Core Spec
-                // Vol 3, Part G, Section 7.2).
-                let mut set = [0u8];
-                let _ = self
+                let mut set = [0u8; crate::gap::CLIENT_SUPPORTED_FEATURES_LEN];
+                let len = self
                     .client_att_tables
-                    .read(&connection.peer_identity(), handle, 0, &mut set);
-                if let (0, Some(new)) = (offset, data.first()) {
-                    if set[0] & !new != 0 {
-                        return Err(AttErrorCode::VALUE_NOT_ALLOWED);
-                    }
+                    .read(&connection.peer_identity(), handle, 0, &mut set)?;
+                if clears_a_feature(&set[..len], offset, data) {
+                    return Err(AttErrorCode::VALUE_NOT_ALLOWED);
                 }
             }
             return self
@@ -1512,13 +1540,14 @@ mod tests {
         use embassy_futures::join::join;
 
         use super::*;
+        use crate::connection_manager::tests::ADDR_2;
         use crate::connection_manager::ConnectionManager;
         use crate::gatt::GattConnection;
 
         const SIZE: usize = GAP_SERVICE_ATTRIBUTE_COUNT + 4;
         // GAP 1..=5 (with security and central 1..=7), GATT from 6: Service
         // Changed, Client Supported Features, Database Hash, then a service of
-        // one characteristic that notifies.
+        // one characteristic that is read, written and notifies.
         const GATT: u16 = if cfg!(feature = "central") { 8 } else { 6 };
         const SERVICE_CHANGED_VALUE: u16 = GATT + 2;
         const SERVICE_CHANGED_CCCD: u16 = GATT + 3;
@@ -1526,39 +1555,49 @@ mod tests {
         const DATABASE_HASH_VALUE: u16 = GATT + 7;
         const ROBUST: ClientCaching = ClientCaching {
             service_changed: true,
-            supported_features: 1,
+            supported_features: [1, 0, 0, 0],
             change_aware: false,
+        };
+        const NEW: ClientCaching = ClientCaching {
+            service_changed: false,
+            supported_features: [0; 4],
+            change_aware: true,
         };
         const READ: AttClient<'static> = AttClient::Request(AttReq::Read { handle: 3 });
 
-        type Server = AttributeServer<'static, NoopRawMutex, DefaultPacketPool, SIZE, 1>;
+        type Server<const CONN: usize> = AttributeServer<'static, NoopRawMutex, DefaultPacketPool, SIZE, CONN>;
 
-        struct Setup {
+        struct Setup<const CONN: usize = 1> {
             mgr: &'static ConnectionManager<'static, DefaultPacketPool>,
-            server: &'static Server,
+            server: &'static Server<CONN>,
             characteristic: Characteristic<[u8; 2]>,
             conn: Connection<'static, DefaultPacketPool>,
         }
 
         fn setup_caching() -> Setup {
+            setup_slots()
+        }
+
+        /// A server with `CONN` client slots, and one client connected.
+        fn setup_slots<const CONN: usize>() -> Setup<CONN> {
             let mut table: AttributeTable<'static, NoopRawMutex, SIZE> = AttributeTable::new();
             unwrap!(GapConfig::default("trouble").build(&mut table));
             let characteristic = table
                 .add_service(Service::new(Uuid::new_short(0x180d)))
-                .add_characteristic_small(Uuid::new_short(0x2a37), [CharacteristicProp::Notify], [0u8; 2])
+                .add_characteristic_small(
+                    Uuid::new_short(0x2a37),
+                    [
+                        CharacteristicProp::Read,
+                        CharacteristicProp::WriteWithoutResponse,
+                        CharacteristicProp::Notify,
+                    ],
+                    [0u8; 2],
+                )
                 .build();
-            let server: &'static Server = Box::leak(Box::new(AttributeServer::new(table)));
+            let server: &'static Server<CONN> = Box::leak(Box::new(AttributeServer::new(table)));
             let mgr = setup();
             assert!(mgr.poll_accept(LeConnRole::Peripheral, &[], None).is_pending());
-            unwrap!(mgr.connect(
-                ConnHandle::new(0),
-                Address::new(AddrKind::RANDOM, BdAddr::new(ADDR_1)),
-                LeConnRole::Peripheral,
-                ConnParams::new(),
-            ));
-            let Poll::Ready(conn) = mgr.poll_accept(LeConnRole::Peripheral, &[], None) else {
-                panic!("expected connection to be accepted");
-            };
+            let conn = connect_peer(mgr, 0, ADDR_1);
             unwrap!(server.connect(&conn));
             Setup {
                 mgr,
@@ -1566,6 +1605,46 @@ mod tests {
                 characteristic,
                 conn,
             }
+        }
+
+        fn connect_peer(
+            mgr: &'static ConnectionManager<'static, DefaultPacketPool>,
+            handle: u16,
+            addr: [u8; 6],
+        ) -> Connection<'static, DefaultPacketPool> {
+            unwrap!(mgr.connect(
+                ConnHandle::new(handle),
+                Address::new(AddrKind::RANDOM, BdAddr::new(addr)),
+                LeConnRole::Peripheral,
+                ConnParams::new(),
+            ));
+            let Poll::Ready(conn) = mgr.poll_accept(LeConnRole::Peripheral, &[], None) else {
+                panic!("expected connection to be accepted");
+            };
+            conn
+        }
+
+        /// The stack keeps a bond with the client of `conn`.
+        fn bond<const CONN: usize>(s: &Setup<CONN>, conn: &Connection<'static, DefaultPacketPool>) {
+            let bond = BondInformation::new(
+                conn.peer_identity(),
+                crate::security_manager::LongTermKey::new(1),
+                SecurityLevel::EncryptedAuthenticated,
+                true,
+            );
+            unwrap!(s.mgr.security_manager.add_bond_information(bond));
+        }
+
+        fn disconnect<const CONN: usize>(s: &Setup<CONN>, conn: &Connection<'static, DefaultPacketPool>) {
+            sealed::DynamicAttributeServer::disconnect(s.server, conn);
+        }
+
+        /// The client sets its caching state over the air: Service Changed
+        /// indications, and Robust Caching.
+        fn subscribe<const CONN: usize>(s: &Setup<CONN>, conn: &Connection<'static, DefaultPacketPool>) {
+            let mut buf = [0u8; 8];
+            unwrap!(s.server.handle_write_req(conn, &mut buf, SERVICE_CHANGED_CCCD, &[2, 0]));
+            unwrap!(s.server.handle_write_req(conn, &mut buf, CLIENT_FEATURES, &[1]));
         }
 
         fn admit(setup: &Setup, packet: &AttClient<'_>) -> Result<(), AttErrorCode> {
@@ -1579,6 +1658,23 @@ mod tests {
         /// A bonded client's next connection: the server keeps its state.
         fn reconnect(setup: &Setup) {
             unwrap!(setup.server.connect(&setup.conn));
+        }
+
+        /// A PDU from the client.
+        fn pdu(bytes: &[u8]) -> crate::pdu::Pdu<<DefaultPacketPool as PacketPool>::Packet> {
+            let mut packet = unwrap!(DefaultPacketPool::allocate());
+            packet.as_mut()[..bytes.len()].copy_from_slice(bytes);
+            crate::pdu::Pdu::new(packet, bytes.len())
+        }
+
+        /// What the server answers `bytes` through `GattEvent`, as an
+        /// application that accepts every event does.
+        fn answer(s: &Setup, bytes: &[u8]) -> Option<std::vec::Vec<u8>> {
+            let data = crate::gatt::GattData::new(pdu(bytes), s.conn.clone());
+            let reply = unwrap!(crate::gatt::GattEvent::new(data, s.server).accept());
+            let answer = reply.att_payload().map(|payload| payload.to_vec());
+            core::mem::forget(reply);
+            answer
         }
 
         #[test]
@@ -1606,11 +1702,26 @@ mod tests {
             assert_eq!(s.server.database_hash(), s.server.table().hash());
         }
 
-        // The GATT service after a GAP service of Device Name and Appearance
-        // is the start of `attribute::tests::database_hash`, whose hash is
-        // known.
+        // A GAP service of Device Name and Appearance, then the GATT service
+        // as `build_gatt_service` makes it. The expected hash is not from the
+        // specification: it is the AES-CMAC, with a zero key, of this
+        // message (Core Spec Vol 3, Part G, Section 7.3.1), each line a
+        // handle, a type and, for declarations, the value:
+        //
+        // 0100 0028 0018
+        // 0200 0328 02 0300 002a
+        // 0400 0328 02 0500 012a
+        // 0600 0028 0118
+        // 0700 0328 20 0800 052a
+        // 0900 0229
+        // 0a00 0328 0a 0b00 292b
+        // 0c00 0328 02 0d00 2a2b
+        //
+        // > xxd -plain -revert message.txt message.bin
+        // > openssl mac -cipher AES-128-CBC -macopt hexkey:00000000000000000000000000000000 -in message.bin CMAC
+        // 16CE756326C5062BF74022F845C2B21F
         #[test]
-        fn the_database_hash_of_the_gatt_service_is_known() {
+        fn the_database_hash_of_the_gap_and_gatt_services() {
             use bt_hci::uuid::characteristic::{APPEARANCE, DEVICE_NAME};
             let mut table: AttributeTable<'static, NoopRawMutex, 13> = AttributeTable::new();
             let mut gap = table.add_service(Service::new(bt_hci::uuid::service::GAP));
@@ -1638,14 +1749,7 @@ mod tests {
         #[test]
         fn a_new_client_is_change_aware_without_features() {
             let s = setup_caching();
-            assert_eq!(
-                s.server.client_caching(&s.conn),
-                Some(ClientCaching {
-                    service_changed: false,
-                    supported_features: 0,
-                    change_aware: true,
-                })
-            );
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
             assert_eq!(admit(&s, &READ), Ok(()));
         }
 
@@ -1767,7 +1871,7 @@ mod tests {
             s.server.restore_client_caching(
                 &s.conn,
                 ClientCaching {
-                    supported_features: 0,
+                    supported_features: [0; 4],
                     ..ROBUST
                 },
             );
@@ -1800,7 +1904,208 @@ mod tests {
                 &buf[..len],
                 &[att::ATT_ERROR_RSP, att::ATT_WRITE_REQ, CLIENT_FEATURES as u8, 0, 0x13]
             );
-            assert_eq!(unwrap!(s.server.client_caching(&s.conn)).supported_features, 1);
+            assert_eq!(
+                unwrap!(s.server.client_caching(&s.conn)).supported_features,
+                [1, 0, 0, 0]
+            );
+        }
+
+        /// What a write of `value` to Client Supported Features is answered:
+        /// the error code, if refused.
+        fn write_features(s: &Setup, value: &[u8]) -> Option<u8> {
+            let mut buf = [0u8; 8];
+            let len = unwrap!(s.server.handle_write_req(&s.conn, &mut buf, CLIENT_FEATURES, value));
+            match &buf[..len] {
+                [att::ATT_WRITE_RSP] => None,
+                [att::ATT_ERROR_RSP, att::ATT_WRITE_REQ, _, _, code] => Some(*code),
+                other => panic!("unexpected response {other:02x?}"),
+            }
+        }
+
+        #[test]
+        fn client_supported_features_are_variable_length() {
+            const VALUE_NOT_ALLOWED: u8 = 0x13;
+            const INVALID_LENGTH: u8 = 0x0d;
+            let s = setup_caching();
+            // Nothing set yet: an empty value is the all-zero default.
+            assert_eq!(write_features(&s, &[]), None);
+            assert_eq!(write_features(&s, &[1, 2]), None);
+            assert_eq!(
+                unwrap!(s.server.client_caching(&s.conn)).supported_features,
+                [1, 2, 0, 0]
+            );
+            // A shorter value reads the octets it leaves out as zero: it
+            // clears their bits.
+            assert_eq!(write_features(&s, &[1]), Some(VALUE_NOT_ALLOWED));
+            assert_eq!(write_features(&s, &[]), Some(VALUE_NOT_ALLOWED));
+            assert_eq!(write_features(&s, &[0, 2]), Some(VALUE_NOT_ALLOWED));
+            // Zero octets past the set bits clear nothing.
+            assert_eq!(write_features(&s, &[1, 2, 0, 0]), None);
+            assert_eq!(write_features(&s, &[1, 2]), None);
+            assert_eq!(write_features(&s, &[3, 2, 0, 4]), None);
+            assert_eq!(write_features(&s, &[3, 2, 0, 4, 0]), Some(INVALID_LENGTH));
+            assert_eq!(
+                unwrap!(s.server.client_caching(&s.conn)).supported_features,
+                [3, 2, 0, 4]
+            );
+        }
+
+        #[test]
+        fn a_restored_state_keeps_every_feature_octet() {
+            let s = setup_caching();
+            let features = [1, 0, 4, 0];
+            assert!(s.server.restore_client_caching(
+                &s.conn,
+                ClientCaching {
+                    supported_features: features,
+                    ..ROBUST
+                }
+            ));
+            assert_eq!(unwrap!(s.server.client_caching(&s.conn)).supported_features, features);
+            // Restored as the client set it: it still may not clear a bit.
+            assert_eq!(write_features(&s, &[1]), Some(0x13));
+        }
+
+        #[test]
+        fn service_changed_is_at_its_fixed_handle() {
+            assert_eq!(SERVICE_CHANGED_VALUE, crate::gap::SERVICE_CHANGED_VALUE_HANDLE);
+            let s = setup_caching();
+            assert_eq!(unwrap!(s.server.caching).service_changed, SERVICE_CHANGED_VALUE);
+        }
+
+        // Through `GattEvent`, as an application meets them, the PDUs a
+        // change-unaware client with Robust Caching gets.
+        #[test]
+        fn a_change_unaware_client_is_answered_out_of_sync_on_the_wire() {
+            use embassy_futures::poll_once;
+            let s = setup_caching();
+            let cccd = unwrap!(s.characteristic.cccd_handle);
+            unwrap!(sealed::DynamicAttributeServer::set(s.server, &s.conn, cccd, &[1, 0]));
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            let gatt = unwrap!(GattConnection::try_new(s.conn.clone(), s.server));
+
+            // No notification but Service Changed reaches it.
+            let notified = poll_once(s.characteristic.notify(&gatt, &[1, 2], false));
+            assert!(matches!(notified, Poll::Ready(Ok(()))));
+            assert!(poll_once(s.mgr.outbound()).is_pending());
+
+            // A Write Command is ignored: nothing is sent, nothing written.
+            let value = s.characteristic.handle.to_le_bytes();
+            assert_eq!(answer(&s, &[att::ATT_WRITE_CMD, value[0], value[1], 7, 7]), None);
+            assert_eq!(unwrap!(s.server.table().get(&s.characteristic)), [0, 0]);
+
+            // The first request is answered Database Out Of Sync, naming the
+            // handle it names: here the start of its range.
+            let start = SERVICE_CHANGED_VALUE.to_le_bytes();
+            let read_by_type = [att::ATT_READ_BY_TYPE_REQ, start[0], start[1], 0xff, 0xff, 0x37, 0x2a];
+            assert_eq!(
+                answer(&s, &read_by_type).as_deref(),
+                Some(&[att::ATT_ERROR_RSP, att::ATT_READ_BY_TYPE_REQ, start[0], start[1], 0x12][..])
+            );
+            // The next is performed, and the client is change-aware.
+            assert_eq!(
+                answer(&s, &[att::ATT_READ_REQ, value[0], value[1]]).as_deref(),
+                Some(&[att::ATT_READ_RSP, 0, 0][..])
+            );
+            assert!(change_aware(&s));
+
+            // On its next bearer, a Read Request names its handle.
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            reconnect(&s);
+            s.server
+                .client_att_tables
+                .with_client_mut(&s.conn.peer_identity(), |client, _| {
+                    client.caching.change_aware = false;
+                });
+            assert_eq!(
+                answer(&s, &[att::ATT_READ_REQ, value[0], value[1]]).as_deref(),
+                Some(&[att::ATT_ERROR_RSP, att::ATT_READ_REQ, value[0], value[1], 0x12][..])
+            );
+        }
+
+        #[test]
+        fn an_unbonded_client_leaves_nothing_behind() {
+            let s = setup_caching();
+            subscribe(&s, &s.conn);
+            s.server.restore_client_caching(&s.conn, ROBUST);
+            disconnect(&s, &s.conn);
+            unwrap!(s.server.connect(&s.conn));
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
+        }
+
+        #[test]
+        fn a_bonded_client_finds_its_state_on_its_next_connection() {
+            let s = setup_caching();
+            bond(&s, &s.conn);
+            subscribe(&s, &s.conn);
+            disconnect(&s, &s.conn);
+            unwrap!(s.server.connect(&s.conn));
+            assert!(!s.server.restore_client_caching(&s.conn, NEW));
+            assert_eq!(
+                s.server.client_caching(&s.conn),
+                Some(ClientCaching {
+                    change_aware: true,
+                    ..ROBUST
+                })
+            );
+        }
+
+        #[test]
+        fn a_booted_slot_leaves_nothing_behind() {
+            let s = setup_caching();
+            bond(&s, &s.conn);
+            subscribe(&s, &s.conn);
+            disconnect(&s, &s.conn);
+            // The only slot goes to another client.
+            let other = connect_peer(s.mgr, 1, ADDR_2);
+            unwrap!(s.server.connect(&other));
+            assert_eq!(s.server.client_caching(&other), Some(NEW));
+            assert_eq!(s.server.client_caching(&s.conn), None);
+            disconnect(&s, &other);
+            unwrap!(s.server.connect(&s.conn));
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
+            // Nothing held: what the application kept is restored.
+            assert!(s.server.restore_client_caching(&s.conn, ROBUST));
+        }
+
+        #[test]
+        fn a_removed_bond_leaves_nothing_behind() {
+            let s = setup_caching();
+            bond(&s, &s.conn);
+            subscribe(&s, &s.conn);
+            disconnect(&s, &s.conn);
+            unwrap!(s.mgr.security_manager.remove_bond_information(s.conn.peer_identity()));
+            unwrap!(s.server.connect(&s.conn));
+            assert_eq!(s.server.client_caching(&s.conn), Some(NEW));
+            assert!(s.server.restore_client_caching(&s.conn, ROBUST));
+        }
+
+        #[test]
+        fn a_removed_bond_frees_its_slot_for_another_client() {
+            let s = setup_slots::<2>();
+            bond(&s, &s.conn);
+            subscribe(&s, &s.conn);
+            disconnect(&s, &s.conn);
+            unwrap!(s.mgr.security_manager.remove_bond_information(s.conn.peer_identity()));
+            let other = connect_peer(s.mgr, 1, ADDR_2);
+            unwrap!(s.server.connect(&other));
+            assert_eq!(s.server.client_caching(&s.conn), None);
+        }
+
+        #[test]
+        fn a_bonded_client_finds_its_slot_behind_an_empty_one() {
+            let s = setup_slots::<2>();
+            // Slot 0 for an unbonded client, slot 1 for the bonded one.
+            let other = s.conn.clone();
+            let bonded = connect_peer(s.mgr, 1, ADDR_2);
+            unwrap!(s.server.connect(&bonded));
+            bond(&s, &bonded);
+            subscribe(&s, &bonded);
+            disconnect(&s, &bonded);
+            disconnect(&s, &other);
+            unwrap!(s.server.connect(&bonded));
+            assert!(!s.server.restore_client_caching(&bonded, NEW));
+            assert!(unwrap!(s.server.client_caching(&bonded)).service_changed);
         }
 
         #[test]

@@ -738,6 +738,22 @@ impl<'stack, P: PacketPool> Connection<'stack, P> {
         self.manager.is_bonded_peer(self.index)
     }
 
+    /// Whether the stack holds a bond with `identity`, a peer of this or
+    /// another connection.
+    pub(crate) fn is_bonded_identity(&self, identity: &Identity) -> bool {
+        #[cfg(feature = "security")]
+        return self
+            .manager
+            .security_manager
+            .get_peer_bond_information(identity)
+            .is_some_and(|b| b.is_bonded);
+        #[cfg(not(feature = "security"))]
+        {
+            let _ = identity;
+            false
+        }
+    }
+
     /// Try to enable encryption with a bonded peer if it is not yet established
     #[cfg(feature = "security")]
     pub(crate) async fn try_enable_encryption(&self) -> Result<(), Error> {
